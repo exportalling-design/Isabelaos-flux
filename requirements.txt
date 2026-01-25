@@ -1,26 +1,36 @@
 runpod>=1.6.0
 
-diffusers==0.27.2
-transformers==4.43.3
-accelerate==0.33.0
-safetensors==0.4.3
-huggingface_hub>=0.23,<1
-controlnet-aux>=0.0.10
+# ✅ FLUX requiere diffusers más nuevo
+diffusers>=0.31.0,<0.34.0
+transformers>=4.44.0,<5.0.0
+accelerate>=0.34.0
+safetensors>=0.4.3
+huggingface_hub>=0.24,<1.0
 
+# utils
 numpy==1.26.4
 Pillow>=10.0.0,<12.0.0
-imageio==2.34.0
-imageio-ffmpeg==0.4.9
-opencv-python-headless
 einops==0.7.0
 tqdm==4.66.4
 psutil==5.9.8
+rich>=13.7.0
+python-dotenv>=1.0.0
+colorama>=0.4.6
+
+# (a veces necesarios con pipelines modernos)
+protobuf>=4.25.0
+sentencepiece>=0.2.0
+
+# --- tus extras (los dejo igual) ---
+controlnet-aux>=0.0.10
+
+imageio==2.34.0
+imageio-ffmpeg==0.4.9
+opencv-python-headless
 moviepy==2.1.2
 
 peft==0.10.0
-python-dotenv>=1.0.0
-colorama>=0.4.6
-rich>=13.7.0
 
-# 🔹 NUEVO: para segmentar personas y cambiar solo el fondo
+# 🔹 para segmentar personas y cambiar solo el fondo
 rembg>=2.0.0,<3.0.0
+onnxruntime
