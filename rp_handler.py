@@ -1,7 +1,5 @@
-import os
 import io
 import base64
-from datetime import datetime
 from typing import Dict, Any
 
 import torch
@@ -13,8 +11,7 @@ import runpod
 # CONFIG
 # -------------------------------------------------
 MODEL_ID = "black-forest-labs/FLUX.1-schnell"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
 pipe: FluxPipeline | None = None
 
@@ -36,11 +33,11 @@ def get_pipe() -> FluxPipeline:
 
     pipe = FluxPipeline.from_pretrained(
         MODEL_ID,
-        torch_dtype=DTYPE
+        torch_dtype=DTYPE,
     )
 
-    if DEVICE == "cuda":
-        pipe = pipe.to("cuda")
+    # 🔑 CLAVE PARA SERVERLESS
+    pipe.enable_model_cpu_offload()
 
     return pipe
 
@@ -50,7 +47,6 @@ def get_pipe() -> FluxPipeline:
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     input_data = event.get("input", {})
     prompt = input_data.get("prompt", "")
-
     steps = int(input_data.get("steps", 4))
     seed = int(input_data.get("seed", 0))
 
