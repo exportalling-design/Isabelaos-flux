@@ -1,18 +1,11 @@
-# rp_handler.py – Worker Serverless de IsabelaOS Studio (REALISTIC + FLUX)
-# Mantiene EXACTAMENTE el mismo contrato de entrada/salida:
-# - input.action: health | navidad_estudio | headshot_pro | (default txt2img)
-# - output: { image_b64, file_path, mode, ... }
-#
-# ✅ Nuevo: txt2img puede usar FLUX (diffusers FluxPipeline) sin romper tu frontend.
-# ✅ Cache/modelos se guardan en el VOLUMEN (para no descargar cada vez).
-# ✅ Outputs: por defecto NO se guardan en el volumen. Solo base64. (Puedes activar guardado con env.)
+# rp_handler.py – Worker Serverless de IsabelaOS Studio (FLUX + SD Inpaint legacy)
 
 import os
 import io
 import base64
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import numpy as np
 from PIL import Image, ImageFilter, ImageEnhance
@@ -20,7 +13,7 @@ import torch
 
 # ---------------------------------------------------------
 # PARCHE HUGGINGFACE_HUB – cached_download
-# (diffusers todavía lo usa, pero en hf>=0.34 ya no existe)
+# (diffusers todavía lo usa en algunas rutas)
 # ---------------------------------------------------------
 import huggingface_hub as h
 
@@ -34,83 +27,51 @@ if not hasattr(h, "cached_download"):
     print("[PARCHE] huggingface_hub.cached_download definido usando hf_hub_download")
 
 # ---------------------------------------------------------
-# CONFIG CACHE EN VOLUMEN (MUY IMPORTANTE PARA "NO SPACE LEFT")
-# ---------------------------------------------------------
-# Ajusta el mount de tu Network Volume aquí:
-# - Si tu volumen está montado como /runpod/volumes/isabelaos -> deja default
-# - Si tu volumen real es /workspace -> pon ISE_VOLUME_MOUNT=/workspace en env vars del endpoint
-VOLUME_MOUNT = os.getenv("ISE_VOLUME_MOUNT", "/runpod/volumes/isabelaos")
-BASE_DIR = Path(VOLUME_MOUNT)
-
-# Cache dirs dentro del volumen (para que HF/diffusers no usen el disco efímero)
-HF_HOME_DIR = BASE_DIR / "hf_home"
-HF_CACHE_DIR = BASE_DIR / "hf_cache"
-DIFFUSERS_CACHE_DIR = BASE_DIR / "diffusers_cache"
-TORCH_HOME_DIR = BASE_DIR / "torch_home"
-TMP_DIR = BASE_DIR / "tmp"  # temporal en volumen (opcional)
-
-for d in [HF_HOME_DIR, HF_CACHE_DIR, DIFFUSERS_CACHE_DIR, TORCH_HOME_DIR, TMP_DIR]:
-    d.mkdir(parents=True, exist_ok=True)
-
-os.environ.setdefault("HF_HOME", str(HF_HOME_DIR))
-os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(HF_CACHE_DIR))
-os.environ.setdefault("TRANSFORMERS_CACHE", str(HF_CACHE_DIR))
-os.environ.setdefault("DIFFUSERS_CACHE", str(DIFFUSERS_CACHE_DIR))
-os.environ.setdefault("TORCH_HOME", str(TORCH_HOME_DIR))
-
-# ---------------------------------------------------------
 # IMPORTS DE DIFFUSERS Y RUNPOD (después del parche)
 # ---------------------------------------------------------
 from diffusers import (
-    StableDiffusionPipeline,
+    FluxPipeline,
     StableDiffusionInpaintPipeline,
 )
-# FluxPipeline puede no existir en versiones viejas -> lo importamos seguro
-try:
-    from diffusers import FluxPipeline  # type: ignore
-except Exception:
-    FluxPipeline = None  # type: ignore
-
 import runpod
 
 # ---------------------------------------------------------
 # CONFIG GENERAL
 # ---------------------------------------------------------
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Elegís modelo txt2img por provider:
-# - ISE_MODEL_PROVIDER=sd  -> usa SD (Realistic Vision)
-# - ISE_MODEL_PROVIDER=flux -> usa FLUX.1-schnell
-MODEL_PROVIDER = (os.getenv("ISE_MODEL_PROVIDER", "sd") or "sd").strip().lower()
+# Volume base (RunPod Network Volume)
+# OJO: en serverless RunPod monta /runpod/volumes/<volume_name>
+# Si tu volumen se llama "isabela-video", el path será:
+VOLUME_NAME = os.getenv("ISE_VOLUME_NAME", "isabela-video")
+VOLUME_DIR = Path(f"/runpod/volumes/{VOLUME_NAME}")
 
-# SD base (tu actual)
-HF_MODEL_ID_SD = os.getenv("ISE_BASE_MODEL_ID", "SG161222/Realistic_Vision_V5.1_noVAE")
+# Cache HF (IMPORTANTE para que NO use /workspace)
+HF_CACHE_DIR = Path(os.getenv("ISE_HF_CACHE_DIR", str(VOLUME_DIR / "huggingface")))
+TORCH_CACHE_DIR = Path(os.getenv("ISE_TORCH_HOME", str(VOLUME_DIR / "torch")))
 
-# FLUX base (requiere acceso aceptado en HF + token válido)
-HF_MODEL_ID_FLUX = os.getenv("ISE_FLUX_MODEL_ID", "black-forest-labs/FLUX.1-schnell")
+# Carpeta de outputs temporales (si quieres guardar debug en volumen)
+# (Tu backend debería subir a Supabase; esto es opcional)
+OUTPUTS_DIR = Path(os.getenv("ISE_OUTPUTS_DIR", str(VOLUME_DIR / "outputs")))
 
-# Donde se cachean modelos (en volumen)
-MODELS_DIR = BASE_DIR / "models"
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
+for d in [HF_CACHE_DIR, TORCH_CACHE_DIR, OUTPUTS_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
 
-# ⚠️ Outputs:
-# Por defecto NO se guardan. Si querés guardar (solo para debug), pon:
-# ISE_SAVE_OUTPUTS=1
-SAVE_OUTPUTS = os.getenv("ISE_SAVE_OUTPUTS", "0").strip() == "1"
-OUTPUT_DIR = BASE_DIR / "images"
-if SAVE_OUTPUTS:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# Para FLUX
+FLUX_MODEL_ID = os.getenv("ISE_FLUX_MODEL_ID", "black-forest-labs/FLUX.1-schnell")
 
-# ---------------------------------------------------------
-# PIPELINES CACHE (en memoria del worker)
-# ---------------------------------------------------------
-pipe_txt2img_sd: Optional[StableDiffusionPipeline] = None
-pipe_inpaint: Optional[StableDiffusionInpaintPipeline] = None
-pipe_txt2img_flux: Optional[Any] = None  # FluxPipeline
+# Para SD Inpaint (mantener lo que ya te funciona)
+INPAINT_MODEL_ID = os.getenv("ISE_INPAINT_MODEL_ID", "runwayml/stable-diffusion-inpainting")
+
+# Pipelines cacheados
+pipe_flux: FluxPipeline | None = None
+pipe_inpaint: StableDiffusionInpaintPipeline | None = None
 
 # ---------------------------------------------------------
 # HELPERS BÁSICOS
 # ---------------------------------------------------------
+
 def decode_image_from_b64(b64: str) -> Image.Image:
     data = base64.b64decode(b64)
     return Image.open(io.BytesIO(data)).convert("RGB")
@@ -134,7 +95,6 @@ def ensure_size_for_sd(width: int, height: int, max_side: int = 1024) -> tuple[i
 
     width = max((width // 8) * 8, 8)
     height = max((height // 8) * 8, 8)
-
     return width, height
 
 
@@ -146,91 +106,56 @@ def enhance_for_studio(image: Image.Image) -> Image.Image:
     img = ImageEnhance.Sharpness(img).enhance(1.10)
     return img
 
-
-def _maybe_save_output(img: Image.Image, prefix: str) -> str:
-    """
-    Por defecto no guardamos nada (para no mezclar outputs de usuarios).
-    Si ISE_SAVE_OUTPUTS=1, se guarda SOLO para debug.
-    """
-    if not SAVE_OUTPUTS:
-        return ""
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    path = OUTPUT_DIR / f"{prefix}_{ts}.png"
-    img.save(path)
-    return str(path)
-
 # ---------------------------------------------------------
 # CARGA DE PIPELINES
 # ---------------------------------------------------------
-def get_txt2img_pipeline_sd() -> StableDiffusionPipeline:
-    global pipe_txt2img_sd
 
-    if pipe_txt2img_sd is not None:
-        return pipe_txt2img_sd
+def _set_cache_env():
+    # Fuerza a HF/diffusers/transformers a usar volumen
+    os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR))
+    os.environ.setdefault("HF_HUB_CACHE", str(HF_CACHE_DIR))
+    os.environ.setdefault("TRANSFORMERS_CACHE", str(HF_CACHE_DIR))
+    os.environ.setdefault("DIFFUSERS_CACHE", str(HF_CACHE_DIR))
+    os.environ.setdefault("TORCH_HOME", str(TORCH_CACHE_DIR))
 
-    pipe_txt2img_sd = StableDiffusionPipeline.from_pretrained(
-        HF_MODEL_ID_SD,
-        torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
-        cache_dir=str(MODELS_DIR),
-        safety_checker=None,
-        feature_extractor=None,
+
+def get_flux_pipeline() -> FluxPipeline:
+    global pipe_flux
+    if pipe_flux is not None:
+        return pipe_flux
+
+    _set_cache_env()
+
+    # FLUX suele ir mejor en bf16
+    dtype = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+
+    pipe_flux = FluxPipeline.from_pretrained(
+        FLUX_MODEL_ID,
+        torch_dtype=dtype,
+        cache_dir=str(HF_CACHE_DIR),   # clave: volumen
     )
 
     if DEVICE == "cuda":
-        pipe_txt2img_sd = pipe_txt2img_sd.to("cuda")
+        pipe_flux = pipe_flux.to("cuda")
 
-    pipe_txt2img_sd.enable_attention_slicing()
-    return pipe_txt2img_sd
-
-
-def get_txt2img_pipeline_flux():
-    global pipe_txt2img_flux
-
-    if pipe_txt2img_flux is not None:
-        return pipe_txt2img_flux
-
-    if FluxPipeline is None:
-        raise RuntimeError(
-            "FluxPipeline no está disponible con tu versión de diffusers. "
-            "Sube diffusers a una versión que incluya FluxPipeline."
-        )
-
-    # FLUX recomienda bfloat16 en GPU modernas.
-    # Si tu GPU/driver no soporta bien bf16, cambia a float16 en env: ISE_FLUX_DTYPE=float16
-    flux_dtype_env = (os.getenv("ISE_FLUX_DTYPE", "bfloat16") or "bfloat16").strip().lower()
-    if flux_dtype_env == "float16":
-        flux_dtype = torch.float16
-    else:
-        flux_dtype = torch.bfloat16
-
-    pipe_txt2img_flux = FluxPipeline.from_pretrained(
-        HF_MODEL_ID_FLUX,
-        torch_dtype=flux_dtype if DEVICE == "cuda" else torch.float32,
-        cache_dir=str(MODELS_DIR),
-    )
-
-    if DEVICE == "cuda":
-        pipe_txt2img_flux = pipe_txt2img_flux.to("cuda")
-
-    # Opcional: reduce picos de VRAM
-    try:
-        pipe_txt2img_flux.enable_attention_slicing()
-    except Exception:
-        pass
-
-    return pipe_txt2img_flux
+    return pipe_flux
 
 
 def get_inpaint_pipeline() -> StableDiffusionInpaintPipeline:
     global pipe_inpaint
-
     if pipe_inpaint is not None:
         return pipe_inpaint
 
+    _set_cache_env()
+
+    dtype = torch.float16 if DEVICE == "cuda" else torch.float32
+
     pipe_inpaint = StableDiffusionInpaintPipeline.from_pretrained(
-        "runwayml/stable-diffusion-inpainting",
-        torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
-        cache_dir=str(MODELS_DIR),
+        INPAINT_MODEL_ID,
+        torch_dtype=dtype,
+        cache_dir=str(HF_CACHE_DIR),   # también al volumen
+        safety_checker=None,
+        feature_extractor=None,
     )
 
     if DEVICE == "cuda":
@@ -242,6 +167,7 @@ def get_inpaint_pipeline() -> StableDiffusionInpaintPipeline:
 # ---------------------------------------------------------
 # MÁSCARA – FONDO BLANCO, PERSONA NEGRO
 # ---------------------------------------------------------
+
 def create_background_mask(image: Image.Image) -> Image.Image:
     try:
         from rembg import remove
@@ -258,108 +184,94 @@ def create_background_mask(image: Image.Image) -> Image.Image:
         mask_bg = mask_bg.filter(ImageFilter.MaxFilter(5))
         mask_bg = mask_bg.filter(ImageFilter.GaussianBlur(3))
         return mask_bg
-
     except Exception:
         return Image.new("L", image.size, 0)
 
 # ---------------------------------------------------------
-# TXT2IMG (SD o FLUX) - MISMA FIRMA DE ENTRADA/SALIDA
+# TXT2IMG CON FLUX (DEFAULT)
 # ---------------------------------------------------------
+
 def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
-    prompt = input_data.get("prompt", "") or ""
-    negative_prompt = input_data.get("negative_prompt", "") or ""
+    pipe = get_flux_pipeline()
 
-    width, height = ensure_size_for_sd(
-        int(input_data.get("width", 512)),
-        int(input_data.get("height", 512)),
-    )
+    prompt = (input_data.get("prompt") or "").strip()
+    if not prompt:
+        raise ValueError("Falta prompt")
 
-    # Defaults: SD(22 pasos) / FLUX(4 pasos)
-    steps = int(input_data.get("steps", 22))
+    # FLUX schnell: 1-4 steps recomendado
+    steps = int(input_data.get("steps", 4))
+    steps = max(1, min(steps, 8))
 
-    # SD guidance default 7.5
-    # FLUX guidance suele ser 0.0 (schnell) según card
-    guidance = float(input_data.get("guidance_scale", 7.5))
+    # Tamaño: FLUX puede con 1024x1024; usamos defaults igual que tu contrato
+    width = int(input_data.get("width", 1024))
+    height = int(input_data.get("height", 1024))
+    width, height = ensure_size_for_sd(width, height, max_side=1024)
 
-    provider = (input_data.get("model_provider") or MODEL_PROVIDER or "sd").strip().lower()
+    # guidance_scale en schnell normalmente 0.0
+    guidance = float(input_data.get("guidance_scale", 0.0))
+    guidance = 0.0 if guidance < 0 else guidance
 
-    if provider == "flux":
-        pipe = get_txt2img_pipeline_flux()
+    # seed opcional
+    seed = input_data.get("seed", None)
+    generator = None
+    if seed is not None:
+        try:
+            seed_int = int(seed)
+            generator = torch.Generator("cpu").manual_seed(seed_int)
+        except Exception:
+            generator = None
 
-        # Forzamos defaults sanos para FLUX schnell
-        if steps <= 0:
-            steps = 4
-        if "guidance_scale" not in input_data:
-            guidance = 0.0  # recomendado en schnell
+    max_seq = int(input_data.get("max_sequence_length", 256))
+    max_seq = max(64, min(max_seq, 512))
 
-        # max_sequence_length para prompts largos (default 256)
-        max_seq = int(input_data.get("max_sequence_length", 256))
-
-        # Seed opcional
-        seed = input_data.get("seed", None)
-        generator = None
-        if seed is not None:
-            try:
-                seed_int = int(seed)
-                generator = torch.Generator(device="cpu").manual_seed(seed_int)
-            except Exception:
-                generator = None
-
-        with torch.autocast("cuda") if DEVICE == "cuda" else torch.no_grad():
+    # Autocast (cuda)
+    if DEVICE == "cuda":
+        with torch.autocast("cuda", dtype=torch.bfloat16):
             out = pipe(
-                prompt,
+                prompt=prompt,
                 guidance_scale=guidance,
                 num_inference_steps=steps,
+                height=height,
+                width=width,
                 max_sequence_length=max_seq,
                 generator=generator,
             )
-
-        img = out.images[0]
-        file_path = _maybe_save_output(img, "isabelaos_flux")
-
-        return {
-            "image_b64": encode_image_to_b64(img),
-            "file_path": file_path,   # "" por defecto (no guardamos)
-            "mode": "txt2img",
-            "provider": "flux",
-            "steps": steps,
-            "guidance_scale": guidance,
-        }
-
-    # default: SD (Realistic Vision)
-    pipe = get_txt2img_pipeline_sd()
-
-    if steps <= 0:
-        steps = 22
-    if guidance <= 0:
-        guidance = 7.5
-
-    with torch.autocast("cuda") if DEVICE == "cuda" else torch.no_grad():
-        result = pipe(
+    else:
+        out = pipe(
             prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=width,
-            height=height,
-            num_inference_steps=steps,
             guidance_scale=guidance,
+            num_inference_steps=steps,
+            height=height,
+            width=width,
+            max_sequence_length=max_seq,
+            generator=generator,
         )
 
-    img = result.images[0]
-    file_path = _maybe_save_output(img, "isabelaos_sd")
+    img = out.images[0]
+
+    # Guardado opcional en volumen (solo para debug). Tu backend debería subir a Supabase.
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    path = OUTPUTS_DIR / f"isabelaos_flux_{ts}.png"
+    try:
+        img.save(path)
+        file_path = str(path)
+    except Exception:
+        file_path = ""
 
     return {
         "image_b64": encode_image_to_b64(img),
-        "file_path": file_path,  # "" por defecto (no guardamos)
+        "file_path": file_path,
         "mode": "txt2img",
-        "provider": "sd",
+        "model": "flux",
         "steps": steps,
-        "guidance_scale": guidance,
+        "width": width,
+        "height": height,
     }
 
 # ---------------------------------------------------------
-# NAVIDAD ESTUDIO (ORIGINAL – SIN TOCAR) ✅
-# Nota: esto sigue usando SD-inpainting (no Flux) porque Flux no es inpaint aquí.
+# NAVIDAD ESTUDIO (MISMA LÓGICA, INPAINT SD)
 # ---------------------------------------------------------
+
 def handle_navidad_estudio(input_data: Dict[str, Any]) -> Dict[str, Any]:
     img_b64 = input_data.get("image_b64")
     if not img_b64:
@@ -408,7 +320,19 @@ def handle_navidad_estudio(input_data: Dict[str, Any]) -> Dict[str, Any]:
 
     pipe = get_inpaint_pipeline()
 
-    with torch.autocast("cuda") if DEVICE == "cuda" else torch.no_grad():
+    if DEVICE == "cuda":
+        with torch.autocast("cuda"):
+            result = pipe(
+                prompt=full_prompt,
+                negative_prompt=negative_prompt,
+                image=original,
+                mask_image=mask_bg,
+                width=w,
+                height=h,
+                num_inference_steps=28,
+                guidance_scale=7.5,
+            )
+    else:
         result = pipe(
             prompt=full_prompt,
             negative_prompt=negative_prompt,
@@ -421,7 +345,13 @@ def handle_navidad_estudio(input_data: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     final_image = result.images[0]
-    file_path = _maybe_save_output(final_image, "isabelaos_navidad_estudio")
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    path = OUTPUTS_DIR / f"isabelaos_navidad_estudio_{ts}.png"
+    try:
+        final_image.save(path)
+        file_path = str(path)
+    except Exception:
+        file_path = ""
 
     return {
         "image_b64": encode_image_to_b64(final_image),
@@ -430,8 +360,9 @@ def handle_navidad_estudio(input_data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 # ---------------------------------------------------------
-# HEADSHOT PRO (ORIGINAL) ✅
+# HEADSHOT PRO (MISMA LÓGICA, INPAINT SD)
 # ---------------------------------------------------------
+
 def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
     img_b64 = input_data.get("image_b64")
     if not img_b64:
@@ -465,7 +396,19 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
 
     pipe = get_inpaint_pipeline()
 
-    with torch.autocast("cuda") if DEVICE == "cuda" else torch.no_grad():
+    if DEVICE == "cuda":
+        with torch.autocast("cuda"):
+            result = pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                image=original,
+                mask_image=mask_bg,
+                width=w,
+                height=h,
+                num_inference_steps=26,
+                guidance_scale=7.0,
+            )
+    else:
         result = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -478,7 +421,13 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     img = result.images[0]
-    file_path = _maybe_save_output(img, "isabelaos_headshot")
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    path = OUTPUTS_DIR / f"isabelaos_headshot_{ts}.png"
+    try:
+        img.save(path)
+        file_path = str(path)
+    except Exception:
+        file_path = ""
 
     return {
         "image_b64": encode_image_to_b64(img),
@@ -488,8 +437,9 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 # ---------------------------------------------------------
-# HANDLER PRINCIPAL (MISMA LÓGICA)
+# HANDLER PRINCIPAL (MISMO CONTRATO)
 # ---------------------------------------------------------
+
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     try:
         input_data = event.get("input") or {}
@@ -498,10 +448,9 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         if action == "health":
             return {
                 "message": "isabelaOs worker online",
-                "provider_default": MODEL_PROVIDER,
                 "device": DEVICE,
-                "volume_mount": str(BASE_DIR),
-                "save_outputs": SAVE_OUTPUTS,
+                "volume": str(VOLUME_DIR),
+                "hf_cache": str(HF_CACHE_DIR),
             }
 
         if action == "navidad_estudio":
@@ -510,7 +459,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         if action == "headshot_pro":
             return handle_headshot_pro(input_data)
 
-        # default: txt2img
+        # default: txt2img (FLUX)
         return handle_txt2img(input_data)
 
     except Exception as e:
