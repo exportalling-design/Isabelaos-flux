@@ -40,8 +40,7 @@ DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 # TXT2IMG
 FLUX_MODEL_ID = "black-forest-labs/FLUX.1-schnell"
 
-# IMG2IMG (para “misma foto pero mejorada”)
-# SDXL es fuerte para producto/estudio manteniendo forma si strength es bajo.
+# IMG2IMG (MISMA FOTO -> mejora estudio)
 SDXL_IMG2IMG_ID = os.environ.get("SDXL_IMG2IMG_ID", "stabilityai/stable-diffusion-xl-base-1.0")
 
 flux_pipe: Optional[FluxPipeline] = None
@@ -72,22 +71,25 @@ def get_img2img():
         return img2img_pipe
 
     print("[IsabelaOS] Loading SDXL IMG2IMG pipeline...")
+    # ✅ Importante: NO usar variant="fp16" aquí (a veces rompe / da negro)
     img2img_pipe = AutoPipelineForImage2Image.from_pretrained(
         SDXL_IMG2IMG_ID,
         torch_dtype=DTYPE,
         cache_dir=os.environ["HF_HUB_CACHE"],
-        variant="fp16" if DTYPE == torch.float16 else None,
         use_safetensors=True,
     )
+
+    # ✅ Desactivar safety checker (para evitar outputs negros por filtro)
+    try:
+        img2img_pipe.safety_checker = None
+        img2img_pipe.requires_safety_checker = False
+    except Exception as e:
+        print("[IsabelaOS] Could not disable safety checker:", repr(e))
+
     if DEVICE == "cuda":
         img2img_pipe = img2img_pipe.to("cuda")
 
-        # Opcional (si te falta VRAM). Comenta si no lo necesitas:
-        # img2img_pipe.enable_xformers_memory_efficient_attention()
-        # img2img_pipe.enable_model_cpu_offload()
-
     return img2img_pipe
-
 
 # ---------------------------------------------------------
 # HELPERS
@@ -110,8 +112,10 @@ def clamp_size(img: Image.Image, max_side: int = 1024) -> Image.Image:
     scale = min(max_side / max(w, h), 1.0)
     nw = int((w * scale) // 8 * 8)
     nh = int((h * scale) // 8 * 8)
-    if nw < 256: nw = 256
-    if nh < 256: nh = 256
+    if nw < 256:
+        nw = 256
+    if nh < 256:
+        nh = 256
     if (nw, nh) != (w, h):
         img = img.resize((nw, nh), Image.LANCZOS)
     return img
@@ -130,7 +134,7 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
 
     with torch.inference_mode():
         if DEVICE == "cuda":
-            with torch.autocast("cuda"):
+            with torch.autocast("cuda", dtype=torch.float16):
                 image = pipe(
                     prompt=prompt,
                     num_inference_steps=steps,
@@ -163,12 +167,10 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
 
     init_img = decode_image(input_data["image_b64"])
     init_img = clamp_size(init_img, max_side=int(input_data.get("max_side", 1024)))
+    w, h = init_img.size
 
-    # PROMPT “foto de producto en estudio”
-    # Lo puedes personalizar por categoría: comida, vidrio, herramientas, etc.
     user_style = (input_data.get("style") or "corporate").strip().lower()
 
-    # Prompt base (mantiene foto, mejora luz/estudio)
     if user_style == "creative":
         prompt = (
             "commercial product photography, studio lighting, softbox light, "
@@ -187,18 +189,15 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
             "high detail, premium e-commerce photo"
         )
 
-    # Negativos para evitar que invente paisajes, personas, etc.
     negative = (
         "waterfall, canyon, landscape, people, face, hands, text, logo, watermark, "
         "extra objects, clutter, messy background, low quality, blurry, cartoon, anime"
     )
 
-    # Parámetros CLAVE para “MISMA FOTO”:
-    # - strength bajo (0.20–0.40) mantiene composición/objeto
-    # - guidance moderado
-    steps = int(input_data.get("steps", 25))
-    guidance = float(input_data.get("guidance", 5.5))
-    strength = float(input_data.get("strength", 0.28))  # 🔥 empieza aquí para mantener “misma foto”
+    # ✅ Más fiel a la misma foto (menos cambios)
+    steps = int(input_data.get("steps", 20))
+    guidance = float(input_data.get("guidance", 5.0))
+    strength = float(input_data.get("strength", 0.20))
     seed = input_data.get("seed", None)
 
     generator = None
@@ -206,12 +205,14 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
         try:
             seed = int(seed)
             generator = torch.Generator(device="cuda" if DEVICE == "cuda" else "cpu").manual_seed(seed)
-        except:
+        except Exception:
             generator = None
+
+    print(f"[headshot_pro] size={w}x{h} steps={steps} guidance={guidance} strength={strength} style={user_style}")
 
     with torch.inference_mode():
         if DEVICE == "cuda":
-            with torch.autocast("cuda"):
+            with torch.autocast("cuda", dtype=torch.float16):
                 out = pipe(
                     prompt=prompt,
                     negative_prompt=negative,
@@ -219,6 +220,8 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
                     strength=strength,
                     guidance_scale=guidance,
                     num_inference_steps=steps,
+                    width=w,
+                    height=h,
                     generator=generator,
                 ).images[0]
         else:
@@ -229,6 +232,8 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
                 strength=strength,
                 guidance_scale=guidance,
                 num_inference_steps=steps,
+                width=w,
+                height=h,
                 generator=generator,
             ).images[0]
 
@@ -242,7 +247,7 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
             "strength": strength,
             "seed": seed,
             "style": user_style,
-            "size": list(init_img.size),
+            "size": [w, h],
         },
     }
 
@@ -255,14 +260,15 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         input_data = event.get("input") or {}
         action = (input_data.get("action") or "").strip()
 
+        print("[IsabelaOS] action =", action or "(empty)")
+
         if action == "health":
             return {"message": "IsabelaOS worker online (FLUX txt2img + SDXL img2img)"}
 
-        # ✅ Tu backend manda action: "headshot_pro"
         if action == "headshot_pro":
             return handle_headshot_pro(input_data)
 
-        # Default: txt2img (lo que ya tenías)
+        # Default: txt2img
         return handle_txt2img(input_data)
 
     except Exception as e:
