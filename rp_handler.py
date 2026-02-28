@@ -9,9 +9,6 @@ import torch
 from PIL import Image
 import runpod
 
-# ---------------------------------------------------------
-# FORZAR CACHE A NETWORK VOLUME (CRÍTICO)
-# ---------------------------------------------------------
 BASE_VOLUME = "/runpod/volumes/isabelaos"
 
 os.environ["HF_HOME"] = f"{BASE_VOLUME}/huggingface"
@@ -29,26 +26,17 @@ for p in [
 ]:
     os.makedirs(p, exist_ok=True)
 
-# ---------------------------------------------------------
-# IMPORTS DESPUÉS DEL CACHE
-# ---------------------------------------------------------
 from diffusers import FluxPipeline, AutoPipelineForImage2Image
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
-# TXT2IMG
 FLUX_MODEL_ID = "black-forest-labs/FLUX.1-schnell"
-
-# IMG2IMG (MISMA FOTO -> mejora estudio)
 SDXL_IMG2IMG_ID = os.environ.get("SDXL_IMG2IMG_ID", "stabilityai/stable-diffusion-xl-base-1.0")
 
 flux_pipe: Optional[FluxPipeline] = None
 img2img_pipe = None
 
-# ---------------------------------------------------------
-# PIPELINES (SE CARGAN UNA SOLA VEZ)
-# ---------------------------------------------------------
 def get_flux() -> FluxPipeline:
     global flux_pipe
     if flux_pipe is not None:
@@ -71,7 +59,6 @@ def get_img2img():
         return img2img_pipe
 
     print("[IsabelaOS] Loading SDXL IMG2IMG pipeline...")
-    # ✅ Importante: NO usar variant="fp16" aquí (a veces rompe / da negro)
     img2img_pipe = AutoPipelineForImage2Image.from_pretrained(
         SDXL_IMG2IMG_ID,
         torch_dtype=DTYPE,
@@ -79,7 +66,7 @@ def get_img2img():
         use_safetensors=True,
     )
 
-    # ✅ Desactivar safety checker (para evitar outputs negros por filtro)
+    # Desactivar safety checker por si estaba devolviendo negro
     try:
         img2img_pipe.safety_checker = None
         img2img_pipe.requires_safety_checker = False
@@ -91,13 +78,18 @@ def get_img2img():
 
     return img2img_pipe
 
-# ---------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------
-def encode_image(img: Image.Image) -> str:
+
+# ✅ CAMBIO CLAVE: JPG ligero + data URL
+def encode_image_jpg(img: Image.Image, quality: int = 92) -> Dict[str, str]:
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
+    img = img.convert("RGB")
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return {
+        "image_b64": b64,
+        "image_data_url": "data:image/jpeg;base64," + b64,
+        "mime": "image/jpeg",
+    }
 
 
 def decode_image(b64_str: str) -> Image.Image:
@@ -106,24 +98,19 @@ def decode_image(b64_str: str) -> Image.Image:
     return img
 
 
-def clamp_size(img: Image.Image, max_side: int = 1024) -> Image.Image:
-    # SDXL va mejor con múltiplos de 8 y tamaños ~1024
+def clamp_size(img: Image.Image, max_side: int = 768) -> Image.Image:
+    # ✅ baja a 768 para que el base64 sea MUCHO más pequeño
     w, h = img.size
     scale = min(max_side / max(w, h), 1.0)
     nw = int((w * scale) // 8 * 8)
     nh = int((h * scale) // 8 * 8)
-    if nw < 256:
-        nw = 256
-    if nh < 256:
-        nh = 256
+    if nw < 256: nw = 256
+    if nh < 256: nh = 256
     if (nw, nh) != (w, h):
         img = img.resize((nw, nh), Image.LANCZOS)
     return img
 
 
-# ---------------------------------------------------------
-# TXT2IMG (FLUX)
-# ---------------------------------------------------------
 def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
     pipe = get_flux()
 
@@ -149,16 +136,14 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
                 height=height,
             ).images[0]
 
+    enc = encode_image_jpg(image)
     return {
-        "image_b64": encode_image(image),
+        **enc,
         "mode": "txt2img_flux",
         "engine": "flux",
     }
 
 
-# ---------------------------------------------------------
-# IMG2IMG (SDXL) – “MISMA FOTO” PERO MEJORADA A ESTUDIO
-# ---------------------------------------------------------
 def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
     pipe = get_img2img()
 
@@ -166,7 +151,7 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "MISSING_IMAGE_B64"}
 
     init_img = decode_image(input_data["image_b64"])
-    init_img = clamp_size(init_img, max_side=int(input_data.get("max_side", 1024)))
+    init_img = clamp_size(init_img, max_side=int(input_data.get("max_side", 768)))
     w, h = init_img.size
 
     user_style = (input_data.get("style") or "corporate").strip().lower()
@@ -194,7 +179,7 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
         "extra objects, clutter, messy background, low quality, blurry, cartoon, anime"
     )
 
-    # ✅ Más fiel a la misma foto (menos cambios)
+    # más fiel a la misma foto
     steps = int(input_data.get("steps", 20))
     guidance = float(input_data.get("guidance", 5.0))
     strength = float(input_data.get("strength", 0.20))
@@ -237,8 +222,9 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
                 generator=generator,
             ).images[0]
 
+    enc = encode_image_jpg(out)
     return {
-        "image_b64": encode_image(out),
+        **enc,
         "mode": "img2img_sdxl_product_studio",
         "engine": "sdxl_img2img",
         "params": {
@@ -252,14 +238,10 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------
-# HANDLER PRINCIPAL
-# ---------------------------------------------------------
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     try:
         input_data = event.get("input") or {}
         action = (input_data.get("action") or "").strip()
-
         print("[IsabelaOS] action =", action or "(empty)")
 
         if action == "health":
@@ -268,7 +250,6 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         if action == "headshot_pro":
             return handle_headshot_pro(input_data)
 
-        # Default: txt2img
         return handle_txt2img(input_data)
 
     except Exception as e:
