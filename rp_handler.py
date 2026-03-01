@@ -1,4 +1,5 @@
-# rp_handler.py – IsabelaOS Studio (FLUX txt2img + SDXL img2img Product Studio Premium)
+# rp_handler.py – IsabelaOS Studio
+# FLUX txt2img + SDXL img2img Product Studio + SDXL img2img Anime Identity (keep face)
 
 import os
 import io
@@ -29,9 +30,6 @@ for p in [
 ]:
     os.makedirs(p, exist_ok=True)
 
-# ----------------------------
-# Diffusers
-# ----------------------------
 from diffusers import FluxPipeline, AutoPipelineForImage2Image
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -39,7 +37,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # FLUX suele ir bien en fp16
 DTYPE_FLUX = torch.float16 if DEVICE == "cuda" else torch.float32
 
-# SDXL más estable en bf16 (A100 soporta), si no, fp16.
+# SDXL más estable en bf16 si se puede (A100/H100 sí). Si no, fp16.
 DTYPE_SDXL = (
     torch.bfloat16
     if (DEVICE == "cuda" and torch.cuda.is_bf16_supported())
@@ -94,7 +92,7 @@ def get_img2img():
         use_safetensors=True,
     )
 
-    # Safety checker OFF (evita outputs negros por filtros)
+    # Safety checker OFF (a veces devuelve negro)
     try:
         img2img_pipe.safety_checker = None
         img2img_pipe.requires_safety_checker = False
@@ -112,7 +110,6 @@ def get_img2img():
         except Exception as e:
             print("[IsabelaOS] Could not force VAE float32:", repr(e))
 
-        # Opcional (ahorra VRAM y puede ayudar estabilidad)
         try:
             img2img_pipe.enable_vae_slicing()
         except Exception:
@@ -122,7 +119,7 @@ def get_img2img():
 
 
 # ----------------------------
-# Helpers (base64 <-> PIL)
+# Helpers
 # ----------------------------
 def encode_image_jpg(img: Image.Image, quality: int = 92) -> Dict[str, str]:
     buf = io.BytesIO()
@@ -154,7 +151,6 @@ def clamp_size(img: Image.Image, max_side: int = 768) -> Image.Image:
 
 
 def is_flat_or_suspicious(img: Image.Image) -> bool:
-    # Detecta outputs planos (gris/negro)
     try:
         import numpy as np
 
@@ -201,10 +197,10 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
+def handle_product_studio_premium(input_data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    ✅ Este action lo dejamos como "headshot_pro" para no cambiar tu backend ahora,
-    pero en realidad es PRODUCT STUDIO PREMIUM.
+    ✅ Action legacy: headshot_pro (para no romper tu backend actual)
+    En realidad es Product Studio Premium (foto celular -> foto estudio).
     """
     pipe = get_img2img()
 
@@ -215,7 +211,6 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
     init_img = clamp_size(init_img, max_side=int(input_data.get("max_side", 768)))
     w, h = init_img.size
 
-    # ---------- Premium Product Studio Prompt ----------
     prompt = (
         "commercial product photography, professional studio lighting, softbox lighting, "
         "soft natural shadow under the product, clean seamless white background, "
@@ -224,11 +219,10 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     negative = (
-        "text, watermark, logo, people, face, hands, extra objects, clutter, messy background, "
+        "text, watermark, logo, extra objects, clutter, messy background, "
         "low quality, blurry, distorted shape, oversharpen, cartoon, anime, unrealistic lighting"
     )
 
-    # Defaults premium (pero puedes sobre-escribir desde frontend si quieres)
     steps = int(input_data.get("steps", 30))
     guidance = float(input_data.get("guidance", 6.5))
     strength = float(input_data.get("strength", 0.38))
@@ -247,31 +241,18 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     with torch.inference_mode():
-        if DEVICE == "cuda":
-            # ✅ Sin autocast aquí (reduce NaNs/gris)
-            out = pipe(
-                prompt=prompt,
-                negative_prompt=negative,
-                image=init_img,
-                strength=strength,
-                guidance_scale=guidance,
-                num_inference_steps=steps,
-                width=w,
-                height=h,
-                generator=generator,
-            ).images[0]
-        else:
-            out = pipe(
-                prompt=prompt,
-                negative_prompt=negative,
-                image=init_img,
-                strength=strength,
-                guidance_scale=guidance,
-                num_inference_steps=steps,
-                width=w,
-                height=h,
-                generator=generator,
-            ).images[0]
+        # ✅ Sin autocast aquí (reduce NaNs/gris)
+        out = pipe(
+            prompt=prompt,
+            negative_prompt=negative,
+            image=init_img,
+            strength=strength,
+            guidance_scale=guidance,
+            num_inference_steps=steps,
+            width=w,
+            height=h,
+            generator=generator,
+        ).images[0]
 
     warning = None
     if is_flat_or_suspicious(out):
@@ -282,7 +263,93 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
     enc = encode_image_jpg(out)
     return {
         **enc,
-        "mode": "img2img_product_studio_premium",
+        "mode": "product_studio_premium",
+        "engine": "sdxl_img2img",
+        "warning": warning,
+        "params": {
+            "steps": steps,
+            "guidance": guidance,
+            "strength": strength,
+            "seed": seed,
+            "size": [w, h],
+            "dtype_sdxl": str(DTYPE_SDXL),
+            "vae_fp32": True,
+        },
+    }
+
+
+def handle_transform_anime_identity(input_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    ✅ Anime Identity (mantiene identidad facial)
+    Cambia fuerte estilo, PERO sin perder la cara.
+    """
+    pipe = get_img2img()
+
+    if not input_data.get("image_b64"):
+        return {"error": "MISSING_IMAGE_B64"}
+
+    init_img = decode_image(input_data["image_b64"])
+    init_img = clamp_size(init_img, max_side=int(input_data.get("max_side", 768)))
+    w, h = init_img.size
+
+    prompt = (
+        "high detail anime portrait, cinematic lighting, dramatic rim light, "
+        "sharp eyes, preserve facial identity, preserve facial proportions, "
+        "same facial structure, same expression, same hairstyle, "
+        "anime style but realistic proportions, clean high-quality render, "
+        "soft glow, ultra detailed face, smooth skin shading, "
+        "dynamic colorful background, studio quality, trending anime art style"
+    )
+
+    negative = (
+        "different person, unrecognizable face, identity change, face swap, "
+        "deformed face, distorted features, asymmetrical eyes, extra eyes, "
+        "bad anatomy, low quality, blurry, jpeg artifacts, "
+        "cartoonish child style, creepy, melted face, warped head, "
+        "text, watermark, logo"
+    )
+
+    # 👇 parámetros “viral pero conserva identidad”
+    steps = int(input_data.get("steps", 32))
+    guidance = float(input_data.get("guidance", 7.5))
+    strength = float(input_data.get("strength", 0.55))
+    seed = input_data.get("seed", None)
+
+    generator = None
+    if seed is not None:
+        try:
+            seed = int(seed)
+            generator = torch.Generator(device=("cuda" if DEVICE == "cuda" else "cpu")).manual_seed(seed)
+        except Exception:
+            generator = None
+
+    print(
+        f"[anime_identity] size={w}x{h} steps={steps} guidance={guidance} strength={strength} dtype={DTYPE_SDXL}"
+    )
+
+    with torch.inference_mode():
+        out = pipe(
+            prompt=prompt,
+            negative_prompt=negative,
+            image=init_img,
+            strength=strength,
+            guidance_scale=guidance,
+            num_inference_steps=steps,
+            width=w,
+            height=h,
+            generator=generator,
+        ).images[0]
+
+    warning = None
+    if is_flat_or_suspicious(out):
+        warning = "SUSPICIOUS_FLAT_OUTPUT_FALLBACK_TO_INIT"
+        print("[IsabelaOS] WARNING: flat output detected; returning init image fallback.")
+        out = init_img
+
+    enc = encode_image_jpg(out)
+    return {
+        **enc,
+        "mode": "transform_anime_identity",
         "engine": "sdxl_img2img",
         "warning": warning,
         "params": {
@@ -307,10 +374,15 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         print("[IsabelaOS] action =", action or "(empty)")
 
         if action == "health":
-            return {"message": "IsabelaOS worker online (FLUX txt2img + SDXL img2img Product Studio Premium)"}
+            return {"message": "IsabelaOS worker online (FLUX txt2img + SDXL img2img Product + Anime Identity)"}
 
+        # Legacy / actual
         if action == "headshot_pro":
-            return handle_headshot_pro(input_data)
+            return handle_product_studio_premium(input_data)
+
+        # New viral mode
+        if action == "transform_anime_identity":
+            return handle_transform_anime_identity(input_data)
 
         # default: FLUX txt2img
         return handle_txt2img(input_data)
