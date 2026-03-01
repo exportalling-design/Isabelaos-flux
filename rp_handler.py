@@ -1,4 +1,7 @@
 # rp_handler.py – IsabelaOS Studio (FLUX + SDXL IMG2IMG in ONE Serverless Worker)
+# ✅ FIX: SDXL "black output" / NaNs
+#  - Upcast VAE to float32 (most effective)
+#  - Patch image_processor.postprocess to nan_to_num + clamp before uint8 cast
 
 import os
 import io
@@ -36,6 +39,7 @@ SDXL_IMG2IMG_ID = os.environ.get("SDXL_IMG2IMG_ID", "stabilityai/stable-diffusio
 
 flux_pipe: Optional[FluxPipeline] = None
 img2img_pipe = None
+
 
 def get_flux() -> FluxPipeline:
     global flux_pipe
@@ -76,6 +80,42 @@ def get_img2img():
     if DEVICE == "cuda":
         img2img_pipe = img2img_pipe.to("cuda")
 
+    # ✅ FIX A: SDXL suele dar NaNs/negro si VAE queda en fp16 -> upcast a fp32
+    try:
+        if hasattr(img2img_pipe, "upcast_vae"):
+            img2img_pipe.upcast_vae()
+        if hasattr(img2img_pipe, "vae") and img2img_pipe.vae is not None:
+            img2img_pipe.vae.to(dtype=torch.float32)
+        print("[IsabelaOS] SDXL VAE upcast to float32 ✅")
+    except Exception as e:
+        print("[IsabelaOS] VAE upcast failed:", repr(e))
+
+    # ✅ FIX B: blindaje total en postprocess (nan_to_num + clamp) antes del cast a uint8
+    try:
+        ip = getattr(img2img_pipe, "image_processor", None)
+        if ip and hasattr(ip, "postprocess"):
+            _orig_postprocess = ip.postprocess
+
+            def _safe_postprocess(images, *args, **kwargs):
+                import numpy as np
+                import torch as _torch
+
+                if _torch.is_tensor(images):
+                    images = images.float()
+                    images = _torch.nan_to_num(images, nan=0.0, posinf=1.0, neginf=0.0)
+                    images = images.clamp(0.0, 1.0)
+                else:
+                    images = images.astype(np.float32)
+                    images = np.nan_to_num(images, nan=0.0, posinf=1.0, neginf=0.0)
+                    images = np.clip(images, 0.0, 1.0)
+
+                return _orig_postprocess(images, *args, **kwargs)
+
+            ip.postprocess = _safe_postprocess
+            print("[IsabelaOS] image_processor.postprocess patched ✅")
+    except Exception as e:
+        print("[IsabelaOS] postprocess patch failed:", repr(e))
+
     return img2img_pipe
 
 
@@ -104,8 +144,10 @@ def clamp_size(img: Image.Image, max_side: int = 768) -> Image.Image:
     scale = min(max_side / max(w, h), 1.0)
     nw = int((w * scale) // 8 * 8)
     nh = int((h * scale) // 8 * 8)
-    if nw < 256: nw = 256
-    if nh < 256: nh = 256
+    if nw < 256:
+        nw = 256
+    if nh < 256:
+        nh = 256
     if (nw, nh) != (w, h):
         img = img.resize((nw, nh), Image.LANCZOS)
     return img
@@ -255,5 +297,6 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         print("[IsabelaOS ERROR]", repr(e))
         return {"error": str(e)}
+
 
 runpod.serverless.start({"handler": handler})
