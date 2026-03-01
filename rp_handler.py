@@ -1,8 +1,4 @@
 # rp_handler.py – IsabelaOS Studio (FLUX + SDXL IMG2IMG in ONE Serverless Worker)
-# ✅ FIX: SDXL "black output" / NaNs
-#  - Upcast VAE to float32 (most effective)
-#  - Patch image_processor.postprocess to nan_to_num + clamp before uint8 cast
-
 import os
 import io
 import base64
@@ -32,13 +28,26 @@ for p in [
 from diffusers import FluxPipeline, AutoPipelineForImage2Image
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
+
+# ✅ DTYPE: FLUX ok en fp16; SDXL img2img mejor en bf16 en A100
+DTYPE_FLUX = torch.float16 if DEVICE == "cuda" else torch.float32
+DTYPE_SDXL = (torch.bfloat16 if (DEVICE == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16) if DEVICE == "cuda" else torch.float32
 
 FLUX_MODEL_ID = "black-forest-labs/FLUX.1-schnell"
 SDXL_IMG2IMG_ID = os.environ.get("SDXL_IMG2IMG_ID", "stabilityai/stable-diffusion-xl-base-1.0")
 
 flux_pipe: Optional[FluxPipeline] = None
 img2img_pipe = None
+
+
+def _set_torch_tweaks():
+    if DEVICE == "cuda":
+        # ayudan a estabilidad/perf
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+
+_set_torch_tweaks()
 
 
 def get_flux() -> FluxPipeline:
@@ -49,7 +58,7 @@ def get_flux() -> FluxPipeline:
     print("[IsabelaOS] Loading FLUX pipeline...")
     flux_pipe = FluxPipeline.from_pretrained(
         FLUX_MODEL_ID,
-        torch_dtype=DTYPE,
+        torch_dtype=DTYPE_FLUX,
         cache_dir=os.environ["HF_HUB_CACHE"],
     )
     if DEVICE == "cuda":
@@ -65,12 +74,12 @@ def get_img2img():
     print("[IsabelaOS] Loading SDXL IMG2IMG pipeline...")
     img2img_pipe = AutoPipelineForImage2Image.from_pretrained(
         SDXL_IMG2IMG_ID,
-        torch_dtype=DTYPE,
+        torch_dtype=DTYPE_SDXL,
         cache_dir=os.environ["HF_HUB_CACHE"],
         use_safetensors=True,
     )
 
-    # Desactivar safety checker por si estaba devolviendo negro
+    # ✅ Safety checker off (no negro por filtros)
     try:
         img2img_pipe.safety_checker = None
         img2img_pipe.requires_safety_checker = False
@@ -80,46 +89,23 @@ def get_img2img():
     if DEVICE == "cuda":
         img2img_pipe = img2img_pipe.to("cuda")
 
-    # ✅ FIX A: SDXL suele dar NaNs/negro si VAE queda en fp16 -> upcast a fp32
-    try:
-        if hasattr(img2img_pipe, "upcast_vae"):
-            img2img_pipe.upcast_vae()
-        if hasattr(img2img_pipe, "vae") and img2img_pipe.vae is not None:
-            img2img_pipe.vae.to(dtype=torch.float32)
-        print("[IsabelaOS] SDXL VAE upcast to float32 ✅")
-    except Exception as e:
-        print("[IsabelaOS] VAE upcast failed:", repr(e))
+        # ✅ CLAVE: VAE en float32 para evitar NaNs/gray output
+        try:
+            if hasattr(img2img_pipe, "vae") and img2img_pipe.vae is not None:
+                img2img_pipe.vae.to(dtype=torch.float32)
+                print("[IsabelaOS] SDXL VAE forced to float32 ✅")
+        except Exception as e:
+            print("[IsabelaOS] Could not force VAE float32:", repr(e))
 
-    # ✅ FIX B: blindaje total en postprocess (nan_to_num + clamp) antes del cast a uint8
-    try:
-        ip = getattr(img2img_pipe, "image_processor", None)
-        if ip and hasattr(ip, "postprocess"):
-            _orig_postprocess = ip.postprocess
-
-            def _safe_postprocess(images, *args, **kwargs):
-                import numpy as np
-                import torch as _torch
-
-                if _torch.is_tensor(images):
-                    images = images.float()
-                    images = _torch.nan_to_num(images, nan=0.0, posinf=1.0, neginf=0.0)
-                    images = images.clamp(0.0, 1.0)
-                else:
-                    images = images.astype(np.float32)
-                    images = np.nan_to_num(images, nan=0.0, posinf=1.0, neginf=0.0)
-                    images = np.clip(images, 0.0, 1.0)
-
-                return _orig_postprocess(images, *args, **kwargs)
-
-            ip.postprocess = _safe_postprocess
-            print("[IsabelaOS] image_processor.postprocess patched ✅")
-    except Exception as e:
-        print("[IsabelaOS] postprocess patch failed:", repr(e))
+        # opcional, ayuda VRAM/estabilidad
+        try:
+            img2img_pipe.enable_vae_slicing()
+        except Exception:
+            pass
 
     return img2img_pipe
 
 
-# ✅ CAMBIO CLAVE: JPG ligero + data URL
 def encode_image_jpg(img: Image.Image, quality: int = 92) -> Dict[str, str]:
     buf = io.BytesIO()
     img = img.convert("RGB")
@@ -139,23 +125,30 @@ def decode_image(b64_str: str) -> Image.Image:
 
 
 def clamp_size(img: Image.Image, max_side: int = 768) -> Image.Image:
-    # ✅ baja a 768 para que el base64 sea MUCHO más pequeño
     w, h = img.size
     scale = min(max_side / max(w, h), 1.0)
     nw = int((w * scale) // 8 * 8)
     nh = int((h * scale) // 8 * 8)
-    if nw < 256:
-        nw = 256
-    if nh < 256:
-        nh = 256
+    nw = max(nw, 256)
+    nh = max(nh, 256)
     if (nw, nh) != (w, h):
         img = img.resize((nw, nh), Image.LANCZOS)
     return img
 
 
+def is_flat_or_suspicious(img: Image.Image) -> bool:
+    # detecta imágenes “planas” (gris/negro) típicas de NaNs
+    try:
+        import numpy as np
+        arr = np.array(img.convert("RGB"), dtype=np.uint8)
+        # si casi no hay variación -> sospechoso
+        return (arr.std() < 2.0)
+    except Exception:
+        return False
+
+
 def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
     pipe = get_flux()
-
     prompt = input_data.get("prompt", "")
     steps = int(input_data.get("steps", 4))
     width = int(input_data.get("width", 1024))
@@ -163,27 +156,14 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
 
     with torch.inference_mode():
         if DEVICE == "cuda":
-            with torch.autocast("cuda", dtype=torch.float16):
-                image = pipe(
-                    prompt=prompt,
-                    num_inference_steps=steps,
-                    width=width,
-                    height=height,
-                ).images[0]
+            # FLUX ok con autocast fp16
+            with torch.autocast("cuda", dtype=DTYPE_FLUX):
+                image = pipe(prompt=prompt, num_inference_steps=steps, width=width, height=height).images[0]
         else:
-            image = pipe(
-                prompt=prompt,
-                num_inference_steps=steps,
-                width=width,
-                height=height,
-            ).images[0]
+            image = pipe(prompt=prompt, num_inference_steps=steps, width=width, height=height).images[0]
 
     enc = encode_image_jpg(image)
-    return {
-        **enc,
-        "mode": "txt2img_flux",
-        "engine": "flux",
-    }
+    return {**enc, "mode": "txt2img_flux", "engine": "flux"}
 
 
 def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -200,28 +180,25 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
 
     if user_style == "creative":
         prompt = (
-            "commercial product photography, studio lighting, softbox light, "
-            "high detail, clean composition, natural colors, sharp focus, "
-            "premium advertising photo, seamless background, realistic"
+            "professional portrait photo, studio lighting, softbox, clean background, "
+            "high detail, realistic skin texture, sharp focus, premium look"
         )
     elif user_style == "influencer":
         prompt = (
-            "product photo, natural lifestyle studio lighting, clean background, "
-            "sharp focus, realistic, premium social media product shot"
+            "portrait photo, natural soft lighting, clean background, "
+            "sharp focus, realistic, premium social media headshot"
         )
     else:
         prompt = (
-            "commercial product photography, professional studio lighting, "
-            "soft shadows, clean seamless background, sharp focus, realistic, "
-            "high detail, premium e-commerce photo"
+            "professional corporate headshot portrait, studio lighting, soft shadows, "
+            "clean seamless background, sharp focus, realistic, high detail"
         )
 
     negative = (
-        "waterfall, canyon, landscape, people, face, hands, text, logo, watermark, "
-        "extra objects, clutter, messy background, low quality, blurry, cartoon, anime"
+        "text, logo, watermark, deformed face, extra limbs, blurry, low quality, "
+        "cartoon, anime, oversaturated, artifacts"
     )
 
-    # más fiel a la misma foto
     steps = int(input_data.get("steps", 20))
     guidance = float(input_data.get("guidance", 5.0))
     strength = float(input_data.get("strength", 0.20))
@@ -239,18 +216,18 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
 
     with torch.inference_mode():
         if DEVICE == "cuda":
-            with torch.autocast("cuda", dtype=torch.float16):
-                out = pipe(
-                    prompt=prompt,
-                    negative_prompt=negative,
-                    image=init_img,
-                    strength=strength,
-                    guidance_scale=guidance,
-                    num_inference_steps=steps,
-                    width=w,
-                    height=h,
-                    generator=generator,
-                ).images[0]
+            # ✅ IMPORTANTE: NO autocast aquí (reduce NaNs con SDXL)
+            out = pipe(
+                prompt=prompt,
+                negative_prompt=negative,
+                image=init_img,
+                strength=strength,
+                guidance_scale=guidance,
+                num_inference_steps=steps,
+                width=w,
+                height=h,
+                generator=generator,
+            ).images[0]
         else:
             out = pipe(
                 prompt=prompt,
@@ -264,11 +241,19 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
                 generator=generator,
             ).images[0]
 
+    # ✅ si salió “plano gris/negro”, devolver init_img y marcar warning
+    warning = None
+    if is_flat_or_suspicious(out):
+        warning = "SUSPICIOUS_FLAT_OUTPUT"
+        print("[IsabelaOS] WARNING: output looks flat (gray/black). Returning init image as fallback.")
+        out = init_img
+
     enc = encode_image_jpg(out)
     return {
         **enc,
-        "mode": "img2img_sdxl_product_studio",
+        "mode": "img2img_sdxl_headshot_pro",
         "engine": "sdxl_img2img",
+        "warning": warning,
         "params": {
             "steps": steps,
             "guidance": guidance,
@@ -276,6 +261,8 @@ def handle_headshot_pro(input_data: Dict[str, Any]) -> Dict[str, Any]:
             "seed": seed,
             "style": user_style,
             "size": [w, h],
+            "dtype_sdxl": str(DTYPE_SDXL),
+            "vae_fp32": True,
         },
     }
 
@@ -287,7 +274,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         print("[IsabelaOS] action =", action or "(empty)")
 
         if action == "health":
-            return {"message": "IsabelaOS worker online (FLUX txt2img + SDXL img2img)"}
+            return {"message": "IsabelaOS worker online (FLUX txt2img + SDXL img2img headshot_pro)"}
 
         if action == "headshot_pro":
             return handle_headshot_pro(input_data)
