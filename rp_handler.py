@@ -1,5 +1,6 @@
 # rp_handler.py – IsabelaOS Studio
 # FLUX txt2img + SDXL img2img Product Studio + SDXL img2img Anime Identity (keep face)
+# + Prompt libre por usuario (sin romper legacy)
 
 import os
 import io
@@ -153,11 +154,18 @@ def clamp_size(img: Image.Image, max_side: int = 768) -> Image.Image:
 def is_flat_or_suspicious(img: Image.Image) -> bool:
     try:
         import numpy as np
-
         arr = np.array(img.convert("RGB"), dtype=np.uint8)
         return arr.std() < 2.0
     except Exception:
         return False
+
+
+def _safe_text(s: Any, max_len: int = 1200) -> str:
+    s = "" if s is None else str(s)
+    s = s.replace("\x00", "").strip()
+    if len(s) > max_len:
+        s = s[:max_len]
+    return s
 
 
 # ----------------------------
@@ -201,6 +209,7 @@ def handle_product_studio_premium(input_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     ✅ Action legacy: headshot_pro (para no romper tu backend actual)
     En realidad es Product Studio Premium (foto celular -> foto estudio).
+    + Prompt libre opcional.
     """
     pipe = get_img2img()
 
@@ -211,17 +220,23 @@ def handle_product_studio_premium(input_data: Dict[str, Any]) -> Dict[str, Any]:
     init_img = clamp_size(init_img, max_side=int(input_data.get("max_side", 768)))
     w, h = init_img.size
 
-    prompt = (
+    # ✅ Prompt libre (si viene)
+    user_prompt = _safe_text(input_data.get("prompt"))
+    user_negative = _safe_text(input_data.get("negative_prompt"))
+
+    default_prompt = (
         "commercial product photography, professional studio lighting, softbox lighting, "
         "soft natural shadow under the product, clean seamless white background, "
         "high-end e-commerce photo, realistic texture detail, sharp focus, color accurate, "
         "premium advertising photo, minimal composition"
     )
-
-    negative = (
+    default_negative = (
         "text, watermark, logo, extra objects, clutter, messy background, "
         "low quality, blurry, distorted shape, oversharpen, cartoon, anime, unrealistic lighting"
     )
+
+    prompt = user_prompt if user_prompt else default_prompt
+    negative = default_negative + (", " + user_negative if user_negative else "")
 
     steps = int(input_data.get("steps", 30))
     guidance = float(input_data.get("guidance", 6.5))
@@ -237,7 +252,8 @@ def handle_product_studio_premium(input_data: Dict[str, Any]) -> Dict[str, Any]:
             generator = None
 
     print(
-        f"[product_studio_premium] size={w}x{h} steps={steps} guidance={guidance} strength={strength} dtype={DTYPE_SDXL}"
+        f"[product_studio_premium] size={w}x{h} steps={steps} guidance={guidance} strength={strength} dtype={DTYPE_SDXL} "
+        f"prompt_user={'yes' if bool(user_prompt) else 'no'}"
     )
 
     with torch.inference_mode():
@@ -274,6 +290,7 @@ def handle_product_studio_premium(input_data: Dict[str, Any]) -> Dict[str, Any]:
             "size": [w, h],
             "dtype_sdxl": str(DTYPE_SDXL),
             "vae_fp32": True,
+            "used_user_prompt": bool(user_prompt),
         },
     }
 
@@ -282,6 +299,7 @@ def handle_transform_anime_identity(input_data: Dict[str, Any]) -> Dict[str, Any
     """
     ✅ Anime Identity (mantiene identidad facial)
     Cambia fuerte estilo, PERO sin perder la cara.
+    + Prompt libre opcional (si el usuario lo escribe, se usa).
     """
     pipe = get_img2img()
 
@@ -292,7 +310,10 @@ def handle_transform_anime_identity(input_data: Dict[str, Any]) -> Dict[str, Any
     init_img = clamp_size(init_img, max_side=int(input_data.get("max_side", 768)))
     w, h = init_img.size
 
-    prompt = (
+    user_prompt = _safe_text(input_data.get("prompt"))
+    user_negative = _safe_text(input_data.get("negative_prompt"))
+
+    default_prompt = (
         "high detail anime portrait, cinematic lighting, dramatic rim light, "
         "sharp eyes, preserve facial identity, preserve facial proportions, "
         "same facial structure, same expression, same hairstyle, "
@@ -301,13 +322,18 @@ def handle_transform_anime_identity(input_data: Dict[str, Any]) -> Dict[str, Any
         "dynamic colorful background, studio quality, trending anime art style"
     )
 
-    negative = (
+    default_negative = (
         "different person, unrecognizable face, identity change, face swap, "
         "deformed face, distorted features, asymmetrical eyes, extra eyes, "
         "bad anatomy, low quality, blurry, jpeg artifacts, "
-        "cartoonish child style, creepy, melted face, warped head, "
+        "creepy, melted face, warped head, "
         "text, watermark, logo"
     )
+
+    prompt = user_prompt if user_prompt else default_prompt
+    # refuerzo identidad (siempre)
+    prompt = prompt + ", same person, preserve identity, same face, same facial structure"
+    negative = default_negative + (", " + user_negative if user_negative else "")
 
     # 👇 parámetros “viral pero conserva identidad”
     steps = int(input_data.get("steps", 32))
@@ -324,7 +350,8 @@ def handle_transform_anime_identity(input_data: Dict[str, Any]) -> Dict[str, Any
             generator = None
 
     print(
-        f"[anime_identity] size={w}x{h} steps={steps} guidance={guidance} strength={strength} dtype={DTYPE_SDXL}"
+        f"[anime_identity] size={w}x{h} steps={steps} guidance={guidance} strength={strength} dtype={DTYPE_SDXL} "
+        f"prompt_user={'yes' if bool(user_prompt) else 'no'}"
     )
 
     with torch.inference_mode():
@@ -360,6 +387,7 @@ def handle_transform_anime_identity(input_data: Dict[str, Any]) -> Dict[str, Any
             "size": [w, h],
             "dtype_sdxl": str(DTYPE_SDXL),
             "vae_fp32": True,
+            "used_user_prompt": bool(user_prompt),
         },
     }
 
@@ -374,7 +402,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         print("[IsabelaOS] action =", action or "(empty)")
 
         if action == "health":
-            return {"message": "IsabelaOS worker online (FLUX txt2img + SDXL img2img Product + Anime Identity)"}
+            return {"message": "IsabelaOS worker online (FLUX txt2img + SDXL img2img Product + Anime Identity + Prompt)"}
 
         # Legacy / actual
         if action == "headshot_pro":
