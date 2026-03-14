@@ -1,10 +1,23 @@
 # rp_handler.py – IsabelaOS Studio
-# FLUX txt2img + SDXL img2img Product Studio + SDXL img2img Anime Identity (keep face)
-# + Prompt libre por usuario (sin romper legacy)
+# FLUX txt2img + SDXL img2img Product Studio + SDXL img2img Anime Identity
+# + Prompt libre por usuario
+# + Avatar support:
+#   - effective_prompt
+#   - avatar_id
+#   - avatar_trigger
+#   - avatar_lora_path
+#   - intento de cargar LoRA desde Supabase Storage con cache local
+#
+# NOTA:
+# - Si el LoRA falla, NO rompe el render.
+# - Hace fallback a prompt + trigger solamente.
 
 import os
 import io
+import json
 import base64
+import urllib.request
+import urllib.parse
 from typing import Dict, Any, Optional
 
 import torch
@@ -31,14 +44,15 @@ for p in [
 ]:
     os.makedirs(p, exist_ok=True)
 
+# cache local para LoRAs de avatar
+LORA_CACHE_DIR = f"{BASE_VOLUME}/avatar_loras"
+os.makedirs(LORA_CACHE_DIR, exist_ok=True)
+
 from diffusers import FluxPipeline, AutoPipelineForImage2Image
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# FLUX suele ir bien en fp16
 DTYPE_FLUX = torch.float16 if DEVICE == "cuda" else torch.float32
-
-# SDXL más estable en bf16 si se puede (A100/H100 sí). Si no, fp16.
 DTYPE_SDXL = (
     torch.bfloat16
     if (DEVICE == "cuda" and torch.cuda.is_bf16_supported())
@@ -51,6 +65,10 @@ SDXL_IMG2IMG_ID = os.environ.get("SDXL_IMG2IMG_ID", "stabilityai/stable-diffusio
 flux_pipe: Optional[FluxPipeline] = None
 img2img_pipe = None
 
+# estado de LoRA actual cargado en FLUX
+current_flux_lora_path: Optional[str] = None
+current_flux_adapter_name: Optional[str] = None
+
 
 def _set_torch_tweaks():
     if DEVICE == "cuda":
@@ -59,6 +77,14 @@ def _set_torch_tweaks():
 
 
 _set_torch_tweaks()
+
+
+# ----------------------------
+# Env helpers
+# ----------------------------
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_AVATAR_BUCKET = os.environ.get("SUPABASE_AVATAR_BUCKET", os.environ.get("AVATAR_BUCKET", "avatars"))
 
 
 # ----------------------------
@@ -93,7 +119,6 @@ def get_img2img():
         use_safetensors=True,
     )
 
-    # Safety checker OFF (a veces devuelve negro)
     try:
         img2img_pipe.safety_checker = None
         img2img_pipe.requires_safety_checker = False
@@ -103,7 +128,6 @@ def get_img2img():
     if DEVICE == "cuda":
         img2img_pipe = img2img_pipe.to("cuda")
 
-        # ✅ CLAVE para evitar outputs grises/NaN: VAE en float32
         try:
             if hasattr(img2img_pipe, "vae") and img2img_pipe.vae is not None:
                 img2img_pipe.vae.to(dtype=torch.float32)
@@ -117,7 +141,6 @@ def get_img2img():
             pass
 
     return img2img_pipe
-
 
 # ----------------------------
 # Helpers
@@ -168,29 +191,205 @@ def _safe_text(s: Any, max_len: int = 1200) -> str:
     return s
 
 
+def _normalize_storage_path(path: str) -> str:
+    p = _safe_text(path, max_len=2000).lstrip("/")
+    bucket_prefix = f"{SUPABASE_AVATAR_BUCKET}/"
+    if p.startswith(bucket_prefix):
+        p = p[len(bucket_prefix):]
+    return p
+
+
+def _make_local_lora_cache_path(storage_path: str) -> str:
+    normalized = _normalize_storage_path(storage_path)
+    safe_name = normalized.replace("/", "__")
+    return os.path.join(LORA_CACHE_DIR, safe_name)
+
+
+def _create_supabase_signed_download_url(storage_path: str, expires_in: int = 3600) -> str:
+    """
+    Crea signed URL usando la API REST de Supabase Storage.
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in worker env")
+
+    normalized_path = _normalize_storage_path(storage_path)
+    encoded_path = urllib.parse.quote(normalized_path, safe="/")
+
+    url = f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_AVATAR_BUCKET}/{encoded_path}"
+
+    payload = json.dumps({"expiresIn": expires_in}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        },
+    )
+
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        raw = resp.read().decode("utf-8")
+        data = json.loads(raw)
+
+    signed_part = data.get("signedURL") or data.get("signedUrl")
+    if not signed_part:
+        raise RuntimeError(f"Could not create signed URL for {normalized_path}: {data}")
+
+    if signed_part.startswith("http://") or signed_part.startswith("https://"):
+        return signed_part
+
+    return f"{SUPABASE_URL}/storage/v1{signed_part}"
+
+
+def _download_avatar_lora_to_cache(storage_path: str) -> str:
+    """
+    Descarga el .safetensors desde Supabase a cache local del worker.
+    """
+    local_path = _make_local_lora_cache_path(storage_path)
+    if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+        print(f"[IsabelaOS] Avatar LoRA already cached: {local_path}")
+        return local_path
+
+    signed_url = _create_supabase_signed_download_url(storage_path)
+    print(f"[IsabelaOS] Downloading avatar LoRA from Supabase: {storage_path}")
+
+    tmp_path = local_path + ".tmp"
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+    with urllib.request.urlopen(signed_url, timeout=120) as resp, open(tmp_path, "wb") as f:
+        while True:
+            chunk = resp.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+
+    os.replace(tmp_path, local_path)
+    print(f"[IsabelaOS] Avatar LoRA cached at: {local_path}")
+    return local_path
+
+
+def _unload_flux_lora_if_any(pipe) -> None:
+    global current_flux_lora_path, current_flux_adapter_name
+
+    try:
+        if hasattr(pipe, "unload_lora_weights"):
+            pipe.unload_lora_weights()
+            print("[IsabelaOS] Previous FLUX LoRA unloaded")
+    except Exception as e:
+        print("[IsabelaOS] Could not unload previous FLUX LoRA:", repr(e))
+
+    current_flux_lora_path = None
+    current_flux_adapter_name = None
+
+
+def _ensure_flux_avatar_lora(pipe, avatar_lora_path: Optional[str], avatar_id: Optional[str]) -> Dict[str, Any]:
+    """
+    Intenta cargar el LoRA del avatar en FLUX.
+    Si falla, devuelve info de warning pero no rompe el render.
+    """
+    global current_flux_lora_path, current_flux_adapter_name
+
+    if not avatar_lora_path:
+        if current_flux_lora_path:
+            _unload_flux_lora_if_any(pipe)
+        return {"used_lora": False, "warning": None}
+
+    try:
+        local_lora_file = _download_avatar_lora_to_cache(avatar_lora_path)
+
+        # si ya está cargado el mismo, no recargar
+        if current_flux_lora_path == local_lora_file:
+            print("[IsabelaOS] Same avatar LoRA already loaded in FLUX")
+            return {"used_lora": True, "warning": None}
+
+        # descargar/cargar nuevo -> descargamos el anterior si había
+        if current_flux_lora_path and current_flux_lora_path != local_lora_file:
+            _unload_flux_lora_if_any(pipe)
+
+        adapter_name = f"avatar_{avatar_id or 'default'}"
+
+        print(f"[IsabelaOS] Loading avatar LoRA into FLUX: {local_lora_file}")
+
+        # diffusers suele trabajar mejor con directorio + weight_name
+        pipe.load_lora_weights(
+            os.path.dirname(local_lora_file),
+            weight_name=os.path.basename(local_lora_file),
+            adapter_name=adapter_name,
+        )
+
+        # activar adapter si existe método
+        try:
+            if hasattr(pipe, "set_adapters"):
+                pipe.set_adapters([adapter_name], adapter_weights=[1.0])
+        except Exception as e:
+            print("[IsabelaOS] Could not set adapter weights:", repr(e))
+
+        current_flux_lora_path = local_lora_file
+        current_flux_adapter_name = adapter_name
+
+        print("[IsabelaOS] Avatar LoRA loaded successfully")
+        return {"used_lora": True, "warning": None}
+
+    except Exception as e:
+        warn = f"AVATAR_LORA_LOAD_FAILED: {e}"
+        print("[IsabelaOS] WARNING:", warn)
+        return {"used_lora": False, "warning": warn}
+
+
 # ----------------------------
 # Actions
 # ----------------------------
 def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
     pipe = get_flux()
 
-    prompt = input_data.get("prompt", "")
+    # prompt base y prompt efectivo
+    prompt = _safe_text(input_data.get("prompt", ""))
+    effective_prompt = _safe_text(input_data.get("effective_prompt", "")) or prompt
+    negative_prompt = _safe_text(input_data.get("negative_prompt", ""))
+
     steps = int(input_data.get("steps", 4))
     width = int(input_data.get("width", 1024))
     height = int(input_data.get("height", 1024))
+
+    avatar_id = _safe_text(input_data.get("avatar_id", "")) or None
+    avatar_name = _safe_text(input_data.get("avatar_name", "")) or None
+    avatar_trigger = _safe_text(input_data.get("avatar_trigger", "")) or None
+    avatar_lora_path = _safe_text(input_data.get("avatar_lora_path", "")) or None
+
+    # intentar cargar LoRA del avatar si viene
+    lora_info = _ensure_flux_avatar_lora(pipe, avatar_lora_path, avatar_id)
+
+    print(
+        "[txt2img_flux]",
+        {
+            "prompt": prompt,
+            "effective_prompt": effective_prompt,
+            "negative_prompt": negative_prompt,
+            "steps": steps,
+            "width": width,
+            "height": height,
+            "avatar_id": avatar_id,
+            "avatar_name": avatar_name,
+            "avatar_trigger": avatar_trigger,
+            "avatar_lora_path": avatar_lora_path,
+            "used_lora": lora_info.get("used_lora"),
+        },
+    )
 
     with torch.inference_mode():
         if DEVICE == "cuda":
             with torch.autocast("cuda", dtype=DTYPE_FLUX):
                 image = pipe(
-                    prompt=prompt,
+                    prompt=effective_prompt,
                     num_inference_steps=steps,
                     width=width,
                     height=height,
                 ).images[0]
         else:
             image = pipe(
-                prompt=prompt,
+                prompt=effective_prompt,
                 num_inference_steps=steps,
                 width=width,
                 height=height,
@@ -201,16 +400,23 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
         **enc,
         "mode": "txt2img_flux",
         "engine": "flux",
-        "params": {"steps": steps, "size": [width, height]},
+        "warning": lora_info.get("warning"),
+        "avatar": {
+            "id": avatar_id,
+            "name": avatar_name,
+            "trigger": avatar_trigger,
+            "lora_path": avatar_lora_path,
+            "used_lora": lora_info.get("used_lora", False),
+        },
+        "params": {
+            "steps": steps,
+            "size": [width, height],
+            "used_effective_prompt": bool(effective_prompt),
+        },
     }
 
 
 def handle_product_studio_premium(input_data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    ✅ Action legacy: headshot_pro (para no romper tu backend actual)
-    En realidad es Product Studio Premium (foto celular -> foto estudio).
-    + Prompt libre opcional.
-    """
     pipe = get_img2img()
 
     if not input_data.get("image_b64"):
@@ -220,7 +426,6 @@ def handle_product_studio_premium(input_data: Dict[str, Any]) -> Dict[str, Any]:
     init_img = clamp_size(init_img, max_side=int(input_data.get("max_side", 768)))
     w, h = init_img.size
 
-    # ✅ Prompt libre (si viene)
     user_prompt = _safe_text(input_data.get("prompt"))
     user_negative = _safe_text(input_data.get("negative_prompt"))
 
@@ -257,7 +462,6 @@ def handle_product_studio_premium(input_data: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     with torch.inference_mode():
-        # ✅ Sin autocast aquí (reduce NaNs/gris)
         out = pipe(
             prompt=prompt,
             negative_prompt=negative,
@@ -296,11 +500,6 @@ def handle_product_studio_premium(input_data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def handle_transform_anime_identity(input_data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    ✅ Anime Identity (mantiene identidad facial)
-    Cambia fuerte estilo, PERO sin perder la cara.
-    + Prompt libre opcional (si el usuario lo escribe, se usa).
-    """
     pipe = get_img2img()
 
     if not input_data.get("image_b64"):
@@ -331,11 +530,9 @@ def handle_transform_anime_identity(input_data: Dict[str, Any]) -> Dict[str, Any
     )
 
     prompt = user_prompt if user_prompt else default_prompt
-    # refuerzo identidad (siempre)
     prompt = prompt + ", same person, preserve identity, same face, same facial structure"
     negative = default_negative + (", " + user_negative if user_negative else "")
 
-    # 👇 parámetros “viral pero conserva identidad”
     steps = int(input_data.get("steps", 32))
     guidance = float(input_data.get("guidance", 7.5))
     strength = float(input_data.get("strength", 0.55))
@@ -391,7 +588,6 @@ def handle_transform_anime_identity(input_data: Dict[str, Any]) -> Dict[str, Any
         },
     }
 
-
 # ----------------------------
 # Main handler
 # ----------------------------
@@ -402,17 +598,14 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         print("[IsabelaOS] action =", action or "(empty)")
 
         if action == "health":
-            return {"message": "IsabelaOS worker online (FLUX txt2img + SDXL img2img Product + Anime Identity + Prompt)"}
+            return {"message": "IsabelaOS worker online (FLUX txt2img + SDXL img2img Product + Anime Identity + Avatar support)"}
 
-        # Legacy / actual
         if action == "headshot_pro":
             return handle_product_studio_premium(input_data)
 
-        # New viral mode
         if action == "transform_anime_identity":
             return handle_transform_anime_identity(input_data)
 
-        # default: FLUX txt2img
         return handle_txt2img(input_data)
 
     except Exception as e:
