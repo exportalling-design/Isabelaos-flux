@@ -4,18 +4,13 @@
 # + Avatar support
 # + NUEVO: compose_scene (Montaje IA local con fondo exacto pixel por pixel)
 #
-# NOTAS:
-# - NO se toca la lógica principal de FLUX que ya te funciona.
-# - Se agrega un módulo nuevo local para montaje realista.
-# - Si el usuario sube fondo, este se usa EXACTO, no se regenera.
-# - El montaje hace:
-#   1) recorte automático del sujeto
-#   2) escalado / posición
-#   3) feather de bordes
-#   4) color match básico
-#   5) blend seamless o alpha
+# AJUSTE IMPORTANTE:
+# - Se mantiene la lógica principal de FLUX.
+# - Se aísla compose_scene para que sus dependencias NO ensucien
+#   el startup del worker normal de generación.
+# - numpy / cv2 / rembg ahora se importan SOLO cuando se usa compose_scene.
 #
-# Requiere además:
+# Requiere además para compose_scene:
 #   pip install numpy opencv-python-headless rembg onnxruntime
 
 import os
@@ -24,16 +19,12 @@ import json
 import base64
 import urllib.request
 import urllib.parse
+import traceback
 from typing import Dict, Any, Optional
 
 import torch
 from PIL import Image
 import runpod
-
-# NUEVO para montaje IA
-import numpy as np
-import cv2
-from rembg import remove as rembg_remove
 
 # ----------------------------
 # Cache paths (RunPod Volume)
@@ -89,6 +80,11 @@ def _set_torch_tweaks():
 
 _set_torch_tweaks()
 
+print("[IsabelaOS] Worker booting...")
+print("[IsabelaOS] DEVICE =", DEVICE)
+print("[IsabelaOS] DTYPE_FLUX =", DTYPE_FLUX)
+print("[IsabelaOS] DTYPE_SDXL =", DTYPE_SDXL)
+print("[IsabelaOS] BASE_VOLUME =", BASE_VOLUME)
 
 # ----------------------------
 # Env helpers
@@ -103,7 +99,9 @@ SUPABASE_AVATAR_BUCKET = os.environ.get("SUPABASE_AVATAR_BUCKET", os.environ.get
 # ----------------------------
 def get_flux() -> FluxPipeline:
     global flux_pipe
+
     if flux_pipe is not None:
+        print("[IsabelaOS] FLUX already loaded ✅")
         return flux_pipe
 
     print("[IsabelaOS] Loading FLUX pipeline...")
@@ -112,14 +110,21 @@ def get_flux() -> FluxPipeline:
         torch_dtype=DTYPE_FLUX,
         cache_dir=os.environ["HF_HUB_CACHE"],
     )
+    print("[IsabelaOS] FLUX pipeline loaded from pretrained ✅")
+
     if DEVICE == "cuda":
+        print("[IsabelaOS] Moving FLUX pipeline to CUDA...")
         flux_pipe = flux_pipe.to("cuda")
+        print("[IsabelaOS] FLUX pipeline moved to CUDA ✅")
+
     return flux_pipe
 
 
 def get_img2img():
     global img2img_pipe
+
     if img2img_pipe is not None:
+        print("[IsabelaOS] SDXL IMG2IMG already loaded ✅")
         return img2img_pipe
 
     print("[IsabelaOS] Loading SDXL IMG2IMG pipeline...")
@@ -129,6 +134,7 @@ def get_img2img():
         cache_dir=os.environ["HF_HUB_CACHE"],
         use_safetensors=True,
     )
+    print("[IsabelaOS] SDXL IMG2IMG loaded from pretrained ✅")
 
     try:
         img2img_pipe.safety_checker = None
@@ -137,7 +143,9 @@ def get_img2img():
         print("[IsabelaOS] Could not disable safety checker:", repr(e))
 
     if DEVICE == "cuda":
+        print("[IsabelaOS] Moving SDXL IMG2IMG to CUDA...")
         img2img_pipe = img2img_pipe.to("cuda")
+        print("[IsabelaOS] SDXL IMG2IMG moved to CUDA ✅")
 
         try:
             if hasattr(img2img_pipe, "vae") and img2img_pipe.vae is not None:
@@ -169,12 +177,9 @@ def encode_image_jpg(img: Image.Image, quality: int = 92) -> Dict[str, str]:
     data_url = "data:image/jpeg;base64," + b64
 
     return {
-        # llaves principales
         "image_b64": b64,
         "image_data_url": data_url,
         "mime": "image/jpeg",
-
-        # aliases legacy
         "result_b64": b64,
         "resultBase64": b64,
         "image": b64,
@@ -202,6 +207,7 @@ def clamp_size(img: Image.Image, max_side: int = 768) -> Image.Image:
 
 def is_flat_or_suspicious(img: Image.Image) -> bool:
     try:
+        import numpy as np
         arr = np.array(img.convert("RGB"), dtype=np.uint8)
         return arr.std() < 2.0
     except Exception:
@@ -232,6 +238,7 @@ def _safe_int(v, d=0):
 
 def _clamp(x, a, b):
     return max(a, min(b, x))
+
 
 # ----------------------------
 # Helpers avatar LoRA
@@ -287,6 +294,7 @@ def _create_supabase_signed_download_url(storage_path: str, expires_in: int = 36
 
 def _download_avatar_lora_to_cache(storage_path: str) -> str:
     local_path = _make_local_lora_cache_path(storage_path)
+
     if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
         print(f"[IsabelaOS] Avatar LoRA already cached: {local_path}")
         return local_path
@@ -372,19 +380,25 @@ def _ensure_flux_avatar_lora(pipe, avatar_lora_path: Optional[str], avatar_id: O
 # ----------------------------
 # Helpers montaje IA
 # ----------------------------
-def _feather_alpha(alpha: np.ndarray, feather_px: int) -> np.ndarray:
+def _feather_alpha(alpha, feather_px: int):
+    import cv2
+
     if feather_px <= 0:
         return alpha
+
     k = feather_px * 2 + 1
     k = max(3, k)
     return cv2.GaussianBlur(alpha, (k, k), 0)
 
 
-def _match_color_simple(fg_bgr: np.ndarray, bg_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def _match_color_simple(fg_bgr, bg_bgr, mask):
     """
     Ajuste simple de media/std por canal usando la zona de fondo cercana.
     No cambia identidad, solo ayuda a integrar color/luz.
     """
+    import numpy as np
+    import cv2
+
     m = (mask > 0)
     if m.sum() < 50:
         return fg_bgr
@@ -411,11 +425,10 @@ def _match_color_simple(fg_bgr: np.ndarray, bg_bgr: np.ndarray, mask: np.ndarray
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def _add_contact_shadow(bg_bgr: np.ndarray, mask_roi: np.ndarray, roi_box, opacity: float = 0.18) -> np.ndarray:
-    """
-    Sombra de contacto simple bajo el sujeto.
-    Muy útil para quitar el look de "pegado".
-    """
+def _add_contact_shadow(bg_bgr, mask_roi, roi_box, opacity: float = 0.18):
+    import numpy as np
+    import cv2
+
     x1, y1, x2, y2 = roi_box
     out = bg_bgr.copy()
 
@@ -425,18 +438,13 @@ def _add_contact_shadow(bg_bgr: np.ndarray, mask_roi: np.ndarray, roi_box, opaci
     if h <= 0 or w <= 0:
         return out
 
-    # Base shadow desde mask
     shadow = (mask_roi > 10).astype(np.uint8) * 255
     shadow = cv2.resize(shadow, (w, h), interpolation=cv2.INTER_LINEAR)
 
-    # Comprimir verticalmente la sombra para que quede debajo de pies/base
     compressed_h = max(8, int(h * 0.18))
     shadow_small = cv2.resize(shadow, (w, compressed_h), interpolation=cv2.INTER_AREA)
-
-    # suavizar
     shadow_small = cv2.GaussianBlur(shadow_small, (0, 0), sigmaX=9, sigmaY=5)
 
-    # crear canvas de sombra
     shadow_canvas = np.zeros((bg_bgr.shape[0], bg_bgr.shape[1]), dtype=np.float32)
 
     sy1 = min(bg_bgr.shape[0] - 1, max(0, y2 - compressed_h // 2))
@@ -451,7 +459,6 @@ def _add_contact_shadow(bg_bgr: np.ndarray, mask_roi: np.ndarray, roi_box, opaci
     shadow_canvas = cv2.GaussianBlur(shadow_canvas, (0, 0), sigmaX=12, sigmaY=8)
     shadow_canvas = np.clip(shadow_canvas * opacity, 0.0, 1.0)
 
-    # oscurecer fondo
     for c in range(3):
         out[..., c] = out[..., c].astype(np.float32) * (1.0 - shadow_canvas)
 
@@ -462,10 +469,8 @@ def _add_contact_shadow(bg_bgr: np.ndarray, mask_roi: np.ndarray, roi_box, opaci
 # Actions
 # ----------------------------
 def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    FLUX txt2img.
-    ESTA PARTE SE DEJA INTACTA, solo con tus mejoras actuales.
-    """
+    print("[IsabelaOS] handle_txt2img() entered")
+
     pipe = get_flux()
 
     prompt = _safe_text(input_data.get("prompt", ""))
@@ -516,6 +521,8 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
                 width=width,
                 height=height,
             ).images[0]
+
+    print("[IsabelaOS] txt2img generation finished ✅")
 
     enc = encode_image_jpg(image)
     return {
@@ -719,13 +726,19 @@ def handle_compose_scene(input_data: Dict[str, Any]) -> Dict[str, Any]:
     No usa Flux.
     No cambia la identidad del sujeto.
     """
+    print("[IsabelaOS] handle_compose_scene() entered")
+
+    # imports diferidos: SOLO si de verdad se usa este modo
+    import numpy as np
+    import cv2
+    from rembg import remove as rembg_remove
+
     fg_b64 = input_data.get("fg_image_b64") or input_data.get("person_image")
     bg_b64 = input_data.get("bg_image_b64") or input_data.get("background_image")
 
     if not fg_b64 or not bg_b64:
         return {"error": "MISSING_FG_OR_BG"}
 
-    # parámetros interpretados por Isabela o enviados por backend
     x = _clamp(_safe_float(input_data.get("x", 0.5), 0.5), 0.0, 1.0)
     y = _clamp(_safe_float(input_data.get("y", 0.72), 0.72), 0.0, 1.0)
     scale = _clamp(_safe_float(input_data.get("scale", 0.55), 0.55), 0.1, 2.0)
@@ -747,21 +760,18 @@ def handle_compose_scene(input_data: Dict[str, Any]) -> Dict[str, Any]:
         },
     )
 
-    # --- cargar imágenes ---
     fg_pil = decode_image(fg_b64).convert("RGBA")
     bg_pil = decode_image(bg_b64).convert("RGB")
 
     bg_bgr = cv2.cvtColor(np.array(bg_pil), cv2.COLOR_RGB2BGR)
     bg_h, bg_w = bg_bgr.shape[:2]
 
-    # --- recorte del sujeto con rembg ---
     fg_rgba = rembg_remove(np.array(fg_pil)).astype(np.uint8)
 
     if fg_rgba.ndim != 3 or fg_rgba.shape[2] == 3:
         alpha = np.ones((fg_rgba.shape[0], fg_rgba.shape[1]), dtype=np.uint8) * 255
         fg_rgba = np.dstack([fg_rgba, alpha])
 
-    # --- escalar sujeto respecto al fondo ---
     fg_h, fg_w = fg_rgba.shape[:2]
     new_w = max(8, int(bg_w * scale))
     ratio = new_w / max(1, fg_w)
@@ -769,7 +779,6 @@ def handle_compose_scene(input_data: Dict[str, Any]) -> Dict[str, Any]:
 
     fg_rgba = cv2.resize(fg_rgba, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
-    # --- calcular posición centrada ---
     cx = int(bg_w * x)
     cy = int(bg_h * y)
 
@@ -778,7 +787,6 @@ def handle_compose_scene(input_data: Dict[str, Any]) -> Dict[str, Any]:
     x2 = x1 + new_w
     y2 = y1 + new_h
 
-    # --- recorte seguro si se sale del canvas ---
     bx1, by1 = max(0, x1), max(0, y1)
     bx2, by2 = min(bg_w, x2), min(bg_h, y2)
 
@@ -794,23 +802,19 @@ def handle_compose_scene(input_data: Dict[str, Any]) -> Dict[str, Any]:
     fg_rgb = fg_crop[..., :3]
     fg_a = fg_crop[..., 3]
 
-    # --- feather en bordes ---
     fg_a = _feather_alpha(fg_a, feather)
     mask255 = fg_a.copy()
 
     bg_roi = bg_bgr[by1:by2, bx1:bx2].copy()
 
-    # --- ajuste de color ---
     if color_match:
         fg_rgb = _match_color_simple(fg_rgb, bg_roi, mask255)
 
-    # --- composición ---
     if blend_mode == "alpha":
         alpha_f = (fg_a.astype(np.float32) / 255.0)[..., None]
         comp = (fg_rgb.astype(np.float32) * alpha_f) + (bg_roi.astype(np.float32) * (1.0 - alpha_f))
         bg_bgr[by1:by2, bx1:bx2] = np.clip(comp, 0, 255).astype(np.uint8)
     else:
-        # seamless = más realista si funciona
         center = (bx1 + (bx2 - bx1) // 2, by1 + (by2 - by1) // 2)
 
         full_mask = np.zeros((bg_h, bg_w), dtype=np.uint8)
@@ -827,7 +831,6 @@ def handle_compose_scene(input_data: Dict[str, Any]) -> Dict[str, Any]:
             comp = (fg_rgb.astype(np.float32) * alpha_f) + (bg_roi.astype(np.float32) * (1.0 - alpha_f))
             bg_bgr[by1:by2, bx1:bx2] = np.clip(comp, 0, 255).astype(np.uint8)
 
-    # --- sombra de contacto ---
     if add_shadow:
         bg_bgr = _add_contact_shadow(bg_bgr, mask255, (bx1, by1, bx2, by2), opacity=0.18)
 
@@ -850,32 +853,35 @@ def handle_compose_scene(input_data: Dict[str, Any]) -> Dict[str, Any]:
         },
     }
 
-   # ----------------------------
+
+# ----------------------------
 # Main handler
 # ----------------------------
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     try:
+        print("[IsabelaOS] handler invoked")
+        print("[IsabelaOS] raw event type =", type(event).__name__)
+
         input_data = event.get("input") or {}
         action = _safe_text(input_data.get("action", "")).lower()
+
         print("[IsabelaOS] action =", action or "(empty)")
+        print("[IsabelaOS] input keys =", list(input_data.keys()))
 
         if action == "health":
             return {
                 "message": "IsabelaOS worker online (FLUX txt2img + SDXL img2img Product + Anime Identity + Avatar support + Compose Scene)"
             }
 
-        # ✅ FLUX intacto
         if action in ["generate", "txt2img_flux", "generate_image", "txt2img"]:
             return handle_txt2img(input_data)
 
-        # ✅ módulos previos intactos
         if action == "headshot_pro":
             return handle_product_studio_premium(input_data)
 
         if action == "transform_anime_identity":
             return handle_transform_anime_identity(input_data)
 
-        # ✅ NUEVO módulo
         if action == "compose_scene":
             return handle_compose_scene(input_data)
 
@@ -883,4 +889,8 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
 
     except Exception as e:
         print("[IsabelaOS ERROR]", repr(e))
+        print(traceback.format_exc())
         return {"error": str(e)}
+
+
+runpod.serverless.start({"handler": handler})
