@@ -850,13 +850,13 @@ def handle_compose_scene(input_data: Dict[str, Any]) -> Dict[str, Any]:
         },
     }
 
-    # ----------------------------
+   # ----------------------------
 # Main handler
 # ----------------------------
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     try:
         input_data = event.get("input") or {}
-        action = _safe_text(input_data.get("action", ""))
+        action = _safe_text(input_data.get("action", "")).lower()
         print("[IsabelaOS] action =", action or "(empty)")
 
         if action == "health":
@@ -865,7 +865,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             }
 
         # ✅ FLUX intacto
-        if action == "txt2img_flux" or action == "generate_image" or action == "txt2img":
+        if action in ["generate", "txt2img_flux", "generate_image", "txt2img"]:
             return handle_txt2img(input_data)
 
         # ✅ módulos previos intactos
@@ -884,8 +884,3 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         print("[IsabelaOS ERROR]", repr(e))
         return {"error": str(e)}
-
-
-runpod.serverless.start({"handler": handler})
-
-                                       
