@@ -23,6 +23,3 @@ imageio-ffmpeg==0.4.9
 opencv-python-headless==4.10.0.84
 
 peft==0.10.0
-
-insightface==0.7.3
-onnxruntime-gpu==1.16.3
