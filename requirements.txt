@@ -21,7 +21,7 @@ colorama>=0.4.6
 protobuf>=4.25.0
 sentencepiece>=0.2.0
 
-# --- tus extras (los dejo igual) ---
+# --- tus extras ---
 controlnet-aux>=0.0.10
 
 imageio==2.34.0
@@ -33,4 +33,8 @@ peft==0.10.0
 
 # 🔹 para segmentar personas y cambiar solo el fondo
 rembg>=2.0.0,<3.0.0
-onnxruntime
+
+# 🔹 identity lock / face swap
+insightface>=0.7.3,<0.8.0
+onnxruntime-gpu>=1.18.0 ; platform_system != "Darwin"
+onnxruntime>=1.18.0 ; platform_system == "Darwin"
