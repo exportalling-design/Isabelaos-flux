@@ -18,15 +18,8 @@ colorama>=0.4.6
 protobuf>=4.25.0
 sentencepiece>=0.2.0
 
-controlnet-aux>=0.0.10
-
 imageio==2.34.0
 imageio-ffmpeg==0.4.9
 opencv-python-headless==4.10.0.84
-moviepy==2.1.2
 
 peft==0.10.0
-
-rembg>=2.0.0,<3.0.0
-onnxruntime==1.19.2
-insightface==0.7.3
