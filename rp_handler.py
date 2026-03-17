@@ -1,17 +1,22 @@
 # rp_handler.py – IsabelaOS Studio
 # FLUX txt2img + SDXL img2img Product Studio + SDXL img2img Anime Identity
-# + Prompt libre por usuario
 # + Avatar support
-# + NUEVO: compose_scene (Montaje IA local con fondo exacto pixel por pixel)
+# + Avatar anchors
+# + Identity lock (face swap) SOLO cuando hay avatar seleccionado
+# + compose_scene (Montaje IA local)
 #
-# AJUSTE IMPORTANTE:
-# - Se mantiene la lógica principal de FLUX.
-# - Se aísla compose_scene para que sus dependencias NO ensucien
-#   el startup del worker normal de generación.
-# - numpy / cv2 / rembg ahora se importan SOLO cuando se usa compose_scene.
+# IMPORTANTE:
+# - NO cambia el flujo de envío del job.
+# - NO cambia el formato de retorno.
+# - NO cambia el polling.
+# - SOLO agrega una etapa extra de identidad cuando hay avatar + anchors.
 #
-# Requiere además para compose_scene:
-#   pip install numpy opencv-python-headless rembg onnxruntime
+# Requiere además:
+#   insightface
+#   onnxruntime-gpu (recomendado en RunPod)
+#   numpy
+#   opencv-python-headless
+#   rembg
 
 import os
 import io
@@ -20,9 +25,11 @@ import base64
 import urllib.request
 import urllib.parse
 import traceback
-from typing import Dict, Any, Optional
+import hashlib
+from typing import Dict, Any, Optional, List
 
 import torch
+import numpy as np
 from PIL import Image
 import runpod
 
@@ -50,6 +57,14 @@ for p in [
 LORA_CACHE_DIR = f"{BASE_VOLUME}/avatar_loras"
 os.makedirs(LORA_CACHE_DIR, exist_ok=True)
 
+# cache local para anchors de avatar
+ANCHOR_CACHE_DIR = f"{BASE_VOLUME}/avatar_anchors"
+os.makedirs(ANCHOR_CACHE_DIR, exist_ok=True)
+
+# cache local para modelos de face swap
+FACE_MODELS_DIR = f"{BASE_VOLUME}/face_models"
+os.makedirs(FACE_MODELS_DIR, exist_ok=True)
+
 from diffusers import FluxPipeline, AutoPipelineForImage2Image
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -64,8 +79,22 @@ DTYPE_SDXL = (
 FLUX_MODEL_ID = "black-forest-labs/FLUX.1-schnell"
 SDXL_IMG2IMG_ID = os.environ.get("SDXL_IMG2IMG_ID", "stabilityai/stable-diffusion-xl-base-1.0")
 
+# Modelo de face swap (puedes precargarlo en el volume)
+INSWAPPER_MODEL_PATH = os.environ.get(
+    "INSWAPPER_MODEL_PATH",
+    f"{FACE_MODELS_DIR}/inswapper_128.onnx",
+)
+INSWAPPER_MODEL_URL = os.environ.get(
+    "INSWAPPER_MODEL_URL",
+    "https://github.com/deepinsight/insightface/releases/download/v0.7/inswapper_128.onnx",
+)
+
 flux_pipe: Optional[FluxPipeline] = None
 img2img_pipe = None
+
+# insightface (lazy load)
+face_analyser = None
+face_swapper = None
 
 # estado de LoRA actual cargado en FLUX
 current_flux_lora_path: Optional[str] = None
@@ -91,8 +120,10 @@ print("[IsabelaOS] BASE_VOLUME =", BASE_VOLUME)
 # ----------------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-SUPABASE_AVATAR_BUCKET = os.environ.get("SUPABASE_AVATAR_BUCKET", os.environ.get("AVATAR_BUCKET", "avatars"))
-
+SUPABASE_AVATAR_BUCKET = os.environ.get(
+    "SUPABASE_AVATAR_BUCKET",
+    os.environ.get("AVATAR_BUCKET", "avatars"),
+)
 
 # ----------------------------
 # Pipelines
@@ -207,7 +238,6 @@ def clamp_size(img: Image.Image, max_side: int = 768) -> Image.Image:
 
 def is_flat_or_suspicious(img: Image.Image) -> bool:
     try:
-        import numpy as np
         arr = np.array(img.convert("RGB"), dtype=np.uint8)
         return arr.std() < 2.0
     except Exception:
@@ -238,6 +268,29 @@ def _safe_int(v, d=0):
 
 def _clamp(x, a, b):
     return max(a, min(b, x))
+
+
+def _safe_list(v) -> List[str]:
+    if not isinstance(v, list):
+        return []
+    out = []
+    for item in v:
+        s = _safe_text(item, max_len=4000)
+        if s:
+            out.append(s)
+    return out
+
+
+def pil_to_bgr(img: Image.Image):
+    import cv2
+    rgb = np.array(img.convert("RGB"))
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
+def bgr_to_pil(arr):
+    import cv2
+    rgb = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(rgb)
 
 
 # ----------------------------
@@ -378,6 +431,211 @@ def _ensure_flux_avatar_lora(pipe, avatar_lora_path: Optional[str], avatar_id: O
 
 
 # ----------------------------
+# Helpers avatar anchors
+# ----------------------------
+def _hash_url(url: str) -> str:
+    return hashlib.sha1(url.encode("utf-8")).hexdigest()
+
+
+def _guess_ext_from_url(url: str) -> str:
+    lower = url.lower()
+    if ".png" in lower:
+        return "png"
+    if ".webp" in lower:
+        return "webp"
+    if ".jpeg" in lower:
+        return "jpeg"
+    if ".jpg" in lower:
+        return "jpg"
+    return "jpg"
+
+
+def _download_url_to_file(url: str, local_path: str) -> str:
+    if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+        print(f"[IsabelaOS] Avatar anchor already cached: {local_path}")
+        return local_path
+
+    tmp_path = local_path + ".tmp"
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+    print("[IsabelaOS] Downloading avatar anchor from signed URL")
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=120) as resp, open(tmp_path, "wb") as f:
+        while True:
+            chunk = resp.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+
+    os.replace(tmp_path, local_path)
+    print(f"[IsabelaOS] Avatar anchor cached at: {local_path}")
+    return local_path
+
+
+def _cache_avatar_anchors(anchor_urls: List[str], avatar_id: Optional[str]) -> List[str]:
+    cached = []
+
+    for i, url in enumerate(anchor_urls[:3]):
+        try:
+            ext = _guess_ext_from_url(url)
+            filename = f"{avatar_id or 'default'}_{i+1}_{_hash_url(url)}.{ext}"
+            local_path = os.path.join(ANCHOR_CACHE_DIR, filename)
+            cached_path = _download_url_to_file(url, local_path)
+            cached.append(cached_path)
+        except Exception as e:
+            print("[IsabelaOS] WARNING: anchor download failed:", repr(e))
+
+    return cached
+
+
+def _load_anchor_images(anchor_urls: List[str], avatar_id: Optional[str]) -> List[Image.Image]:
+    local_files = _cache_avatar_anchors(anchor_urls, avatar_id)
+    images = []
+
+    for path in local_files:
+        try:
+            img = Image.open(path).convert("RGB")
+            images.append(img)
+        except Exception as e:
+            print("[IsabelaOS] WARNING: anchor image open failed:", repr(e))
+
+    return images
+
+
+# ----------------------------
+# Helpers face lock / identity
+# ----------------------------
+def _ensure_file_from_url(url: str, local_path: str) -> str:
+    if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+        return local_path
+
+    tmp_path = local_path + ".tmp"
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+    print(f"[IsabelaOS] Downloading model from: {url}")
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=300) as resp, open(tmp_path, "wb") as f:
+        while True:
+            chunk = resp.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+
+    os.replace(tmp_path, local_path)
+    print(f"[IsabelaOS] Model cached at: {local_path}")
+    return local_path
+
+
+def _get_ort_providers():
+    if DEVICE == "cuda":
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    return ["CPUExecutionProvider"]
+
+
+def get_face_analyser():
+    global face_analyser
+
+    if face_analyser is not None:
+        return face_analyser
+
+    print("[IsabelaOS] Loading FaceAnalysis...")
+    from insightface.app import FaceAnalysis
+
+    face_analyser = FaceAnalysis(
+        name="buffalo_l",
+        root=FACE_MODELS_DIR,
+        providers=_get_ort_providers(),
+    )
+    face_analyser.prepare(
+        ctx_id=0 if DEVICE == "cuda" else -1,
+        det_size=(640, 640),
+    )
+    print("[IsabelaOS] FaceAnalysis ready ✅")
+    return face_analyser
+
+
+def get_face_swapper():
+    global face_swapper
+
+    if face_swapper is not None:
+        return face_swapper
+
+    print("[IsabelaOS] Loading face swapper...")
+    from insightface.model_zoo import get_model as insight_get_model
+
+    if INSWAPPER_MODEL_URL and not os.path.exists(INSWAPPER_MODEL_PATH):
+        _ensure_file_from_url(INSWAPPER_MODEL_URL, INSWAPPER_MODEL_PATH)
+
+    face_swapper = insight_get_model(
+        INSWAPPER_MODEL_PATH,
+        providers=_get_ort_providers(),
+    )
+    print("[IsabelaOS] Face swapper ready ✅")
+    return face_swapper
+
+
+def _pick_largest_face(faces):
+    if not faces:
+        return None
+
+    def area(face):
+        x1, y1, x2, y2 = face.bbox
+        return max(0, (x2 - x1)) * max(0, (y2 - y1))
+
+    faces = sorted(faces, key=area, reverse=True)
+    return faces[0]
+
+
+def _apply_identity_lock(base_image: Image.Image, anchor_images: List[Image.Image]) -> (Image.Image, Optional[str]):
+    """
+    Hace face swap sobre la imagen generada usando la primera anchor válida.
+    Se aplica SOLO si hay cara en anchor y en resultado.
+    """
+    if not anchor_images:
+        return base_image, "IDENTITY_LOCK_SKIPPED_NO_ANCHORS"
+
+    try:
+        import cv2
+
+        analyser = get_face_analyser()
+        swapper = get_face_swapper()
+
+        source_face = None
+        for i, anchor in enumerate(anchor_images):
+            anchor_bgr = pil_to_bgr(anchor)
+            source_faces = analyser.get(anchor_bgr)
+            source_face = _pick_largest_face(source_faces)
+            if source_face is not None:
+                print(f"[IsabelaOS] Source face found in anchor {i+1}")
+                break
+
+        if source_face is None:
+            return base_image, "IDENTITY_LOCK_NO_FACE_IN_ANCHORS"
+
+        target_bgr = pil_to_bgr(base_image)
+        target_faces = analyser.get(target_bgr)
+        target_face = _pick_largest_face(target_faces)
+
+        if target_face is None:
+            return base_image, "IDENTITY_LOCK_NO_FACE_IN_GENERATION"
+
+        swapped_bgr = swapper.get(
+            target_bgr,
+            target_face,
+            source_face,
+            paste_back=True,
+        )
+
+        swapped_pil = bgr_to_pil(swapped_bgr)
+        return swapped_pil, None
+
+    except Exception as e:
+        print("[IsabelaOS] WARNING: identity lock failed:", repr(e))
+        print(traceback.format_exc())
+        return base_image, f"IDENTITY_LOCK_FAILED: {e}"
+
+
+# ----------------------------
 # Helpers montaje IA
 # ----------------------------
 def _feather_alpha(alpha, feather_px: int):
@@ -396,7 +654,6 @@ def _match_color_simple(fg_bgr, bg_bgr, mask):
     Ajuste simple de media/std por canal usando la zona de fondo cercana.
     No cambia identidad, solo ayuda a integrar color/luz.
     """
-    import numpy as np
     import cv2
 
     m = (mask > 0)
@@ -426,7 +683,6 @@ def _match_color_simple(fg_bgr, bg_bgr, mask):
 
 
 def _add_contact_shadow(bg_bgr, mask_roi, roi_box, opacity: float = 0.18):
-    import numpy as np
     import cv2
 
     x1, y1, x2, y2 = roi_box
@@ -486,7 +742,19 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
     avatar_trigger = _safe_text(input_data.get("avatar_trigger", "")) or None
     avatar_lora_path = _safe_text(input_data.get("avatar_lora_path", "")) or None
 
+    avatar_anchor_urls = _safe_list(input_data.get("avatar_anchor_urls"))
+    avatar_anchor_paths = _safe_list(input_data.get("avatar_anchor_paths"))
+
+    # 1) Cargar LoRA si hay avatar
     lora_info = _ensure_flux_avatar_lora(pipe, avatar_lora_path, avatar_id)
+
+    # 2) Cargar anchors si existen
+    anchor_images = []
+    if avatar_anchor_urls:
+        try:
+            anchor_images = _load_anchor_images(avatar_anchor_urls, avatar_id)
+        except Exception as e:
+            print("[IsabelaOS] WARNING: anchor loading failed:", repr(e))
 
     print(
         "[txt2img_flux]",
@@ -501,10 +769,14 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
             "avatar_name": avatar_name,
             "avatar_trigger": avatar_trigger,
             "avatar_lora_path": avatar_lora_path,
+            "avatar_anchor_urls_count": len(avatar_anchor_urls),
+            "avatar_anchor_paths_count": len(avatar_anchor_paths),
+            "anchor_images_loaded": len(anchor_images),
             "used_lora": lora_info.get("used_lora"),
         },
     )
 
+    # 3) Generación base FLUX + LoRA
     with torch.inference_mode():
         if DEVICE == "cuda":
             with torch.autocast("cuda", dtype=DTYPE_FLUX):
@@ -522,7 +794,17 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
                 height=height,
             ).images[0]
 
-    print("[IsabelaOS] txt2img generation finished ✅")
+    print("[IsabelaOS] txt2img base generation finished ✅")
+
+    # 4) Identity lock SOLO si hay avatar + anchors
+    identity_warning = None
+    if avatar_id and anchor_images:
+        print("[IsabelaOS] Applying identity lock...")
+        image, identity_warning = _apply_identity_lock(image, anchor_images)
+        if identity_warning:
+            print("[IsabelaOS] Identity lock warning:", identity_warning)
+        else:
+            print("[IsabelaOS] Identity lock applied ✅")
 
     enc = encode_image_jpg(image)
     return {
@@ -530,12 +812,17 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
         "mode": "txt2img_flux",
         "engine": "flux",
         "warning": lora_info.get("warning"),
+        "identity_warning": identity_warning,
         "avatar": {
             "id": avatar_id,
             "name": avatar_name,
             "trigger": avatar_trigger,
             "lora_path": avatar_lora_path,
             "used_lora": lora_info.get("used_lora", False),
+            "anchor_urls_count": len(avatar_anchor_urls),
+            "anchor_paths_count": len(avatar_anchor_paths),
+            "anchor_images_loaded": len(anchor_images),
+            "identity_lock_applied": identity_warning is None and bool(anchor_images),
         },
         "params": {
             "steps": steps,
@@ -729,7 +1016,6 @@ def handle_compose_scene(input_data: Dict[str, Any]) -> Dict[str, Any]:
     print("[IsabelaOS] handle_compose_scene() entered")
 
     # imports diferidos: SOLO si de verdad se usa este modo
-    import numpy as np
     import cv2
     from rembg import remove as rembg_remove
 
@@ -870,7 +1156,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
 
         if action == "health":
             return {
-                "message": "IsabelaOS worker online (FLUX txt2img + SDXL img2img Product + Anime Identity + Avatar support + Compose Scene)"
+                "message": "IsabelaOS worker online (FLUX txt2img + SDXL img2img Product + Anime Identity + Avatar support + Compose Scene + Identity Lock)"
             }
 
         if action in ["generate", "txt2img_flux", "generate_image", "txt2img"]:
