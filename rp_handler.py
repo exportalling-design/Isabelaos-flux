@@ -1,4 +1,3 @@
-
 # rp_handler.py – IsabelaOS Studio
 # FLUX txt2img + SDXL img2img Product Studio + SDXL img2img Anime Identity
 # + Avatar support
@@ -80,11 +79,8 @@ DTYPE_SDXL = (
 FLUX_MODEL_ID = "black-forest-labs/FLUX.1-schnell"
 SDXL_IMG2IMG_ID = os.environ.get("SDXL_IMG2IMG_ID", "stabilityai/stable-diffusion-xl-base-1.0")
 
-# Modelo de face swap (puedes precargarlo en el volume)
-INSWAPPER_MODEL_PATH = os.environ.get(
-    "INSWAPPER_MODEL_PATH",
-    f"{FACE_MODELS_DIR}/inswapper_128.onnx",
-)
+# Modelo de face swap (ruta FIJA, no depender de ENV para evitar path vacío/incorrecto)
+INSWAPPER_MODEL_PATH = f"{FACE_MODELS_DIR}/inswapper_128.onnx"
 INSWAPPER_MODEL_URL = os.environ.get(
     "INSWAPPER_MODEL_URL",
     "https://github.com/deepinsight/insightface/releases/download/v0.7/inswapper_128.onnx",
@@ -510,8 +506,14 @@ def _ensure_file_from_url(url: str, local_path: str) -> str:
     if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
         return local_path
 
+    # asegurar ruta válida SIEMPRE
+    parent_dir = os.path.dirname(local_path) if local_path else ""
+    if not parent_dir:
+        parent_dir = FACE_MODELS_DIR
+
+    os.makedirs(parent_dir, exist_ok=True)
+
     tmp_path = local_path + ".tmp"
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
     print(f"[IsabelaOS] Downloading model from: {url}")
     req = urllib.request.Request(url, method="GET")
@@ -564,11 +566,18 @@ def get_face_swapper():
     print("[IsabelaOS] Loading face swapper...")
     from insightface.model_zoo import get_model as insight_get_model
 
-    if INSWAPPER_MODEL_URL and not os.path.exists(INSWAPPER_MODEL_PATH):
-        _ensure_file_from_url(INSWAPPER_MODEL_URL, INSWAPPER_MODEL_PATH)
+    # asegurar carpeta SIEMPRE
+    os.makedirs(FACE_MODELS_DIR, exist_ok=True)
+
+    # asegurar path SIEMPRE
+    model_path = INSWAPPER_MODEL_PATH or f"{FACE_MODELS_DIR}/inswapper_128.onnx"
+
+    # descargar si no existe
+    if INSWAPPER_MODEL_URL and not os.path.exists(model_path):
+        _ensure_file_from_url(INSWAPPER_MODEL_URL, model_path)
 
     face_swapper = insight_get_model(
-        INSWAPPER_MODEL_PATH,
+        model_path,
         providers=_get_ort_providers(),
     )
     print("[IsabelaOS] Face swapper ready ✅")
