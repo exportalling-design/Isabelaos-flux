@@ -4,12 +4,14 @@
 # + Avatar anchors
 # + Identity lock (face swap) SOLO cuando hay avatar seleccionado
 # + compose_scene (Montaje IA local)
+# + RealESRGAN upscale final
 #
 # IMPORTANTE:
 # - NO cambia el flujo de envío del job.
 # - NO cambia el formato de retorno.
 # - NO cambia el polling.
 # - SOLO agrega una etapa extra de identidad cuando hay avatar + anchors.
+# - SOLO agrega una etapa final de upscale con RealESRGAN.
 #
 # Requiere además:
 #   insightface
@@ -17,6 +19,8 @@
 #   numpy
 #   opencv-python-headless
 #   rembg
+#   basicsr
+#   realesrgan
 
 import os
 import io
@@ -28,6 +32,7 @@ import traceback
 import hashlib
 from typing import Dict, Any, Optional, List
 
+import cv2
 import torch
 import numpy as np
 from PIL import Image
@@ -65,7 +70,13 @@ os.makedirs(ANCHOR_CACHE_DIR, exist_ok=True)
 FACE_MODELS_DIR = f"{BASE_VOLUME}/face_models"
 os.makedirs(FACE_MODELS_DIR, exist_ok=True)
 
+# cache local para modelos de upscale
+UPSCALE_MODELS_DIR = f"{BASE_VOLUME}/upscale_models"
+os.makedirs(UPSCALE_MODELS_DIR, exist_ok=True)
+
 from diffusers import FluxPipeline, AutoPipelineForImage2Image
+from basicsr.archs.rrdbnet_arch import RRDBNet
+from realesrgan import RealESRGANer
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -79,19 +90,26 @@ DTYPE_SDXL = (
 FLUX_MODEL_ID = "black-forest-labs/FLUX.1-schnell"
 SDXL_IMG2IMG_ID = os.environ.get("SDXL_IMG2IMG_ID", "stabilityai/stable-diffusion-xl-base-1.0")
 
-# Modelo de face swap (ruta FIJA, no depender de ENV para evitar path vacío/incorrecto)
+# Modelo de face swap
 INSWAPPER_MODEL_PATH = f"{FACE_MODELS_DIR}/inswapper_128.onnx"
 INSWAPPER_MODEL_URL = os.environ.get(
     "INSWAPPER_MODEL_URL",
     "https://github.com/deepinsight/insightface/releases/download/v0.7/inswapper_128.onnx",
 )
 
+# Modelo de upscale
+REALESRGAN_MODEL_PATH = f"{UPSCALE_MODELS_DIR}/RealESRGAN_x4plus.pth"
+REALESRGAN_MODEL_URL = (
+    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
+)
+
 flux_pipe: Optional[FluxPipeline] = None
 img2img_pipe = None
 
-# insightface (lazy load)
+# insightface / upscale (lazy load)
 face_analyser = None
 face_swapper = None
+realesrgan_upsampler = None
 
 # estado de LoRA actual cargado en FLUX
 current_flux_lora_path: Optional[str] = None
@@ -279,13 +297,11 @@ def _safe_list(v) -> List[str]:
 
 
 def pil_to_bgr(img: Image.Image):
-    import cv2
     rgb = np.array(img.convert("RGB"))
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
 
 def bgr_to_pil(arr):
-    import cv2
     rgb = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
     return Image.fromarray(rgb)
 
@@ -584,6 +600,42 @@ def get_face_swapper():
     return face_swapper
 
 
+def get_realesrgan_upsampler():
+    global realesrgan_upsampler
+
+    if realesrgan_upsampler is not None:
+        return realesrgan_upsampler
+
+    print("[IsabelaOS] Loading RealESRGAN upsampler...")
+    os.makedirs(UPSCALE_MODELS_DIR, exist_ok=True)
+
+    if not os.path.exists(REALESRGAN_MODEL_PATH):
+        _ensure_file_from_url(REALESRGAN_MODEL_URL, REALESRGAN_MODEL_PATH)
+
+    model = RRDBNet(
+        num_in_ch=3,
+        num_out_ch=3,
+        num_feat=64,
+        num_block=23,
+        num_grow_ch=32,
+        scale=4,
+    )
+
+    realesrgan_upsampler = RealESRGANer(
+        scale=4,
+        model_path=REALESRGAN_MODEL_PATH,
+        model=model,
+        tile=0,
+        tile_pad=10,
+        pre_pad=0,
+        half=(DEVICE == "cuda"),
+        gpu_id=0 if DEVICE == "cuda" else None,
+    )
+
+    print("[IsabelaOS] RealESRGAN ready ✅")
+    return realesrgan_upsampler
+
+
 def _pick_largest_face(faces):
     if not faces:
         return None
@@ -605,8 +657,6 @@ def _apply_identity_lock(base_image: Image.Image, anchor_images: List[Image.Imag
         return base_image, "IDENTITY_LOCK_SKIPPED_NO_ANCHORS"
 
     try:
-        import cv2
-
         analyser = get_face_analyser()
         swapper = get_face_swapper()
 
@@ -645,12 +695,36 @@ def _apply_identity_lock(base_image: Image.Image, anchor_images: List[Image.Imag
         return base_image, f"IDENTITY_LOCK_FAILED: {e}"
 
 
+def _apply_realesrgan_upscale(img: Image.Image, outscale: int = 2) -> Image.Image:
+    """
+    Upscale final con RealESRGAN.
+    outscale=2 para no exagerar peso/tiempo.
+    """
+    try:
+        upsampler = get_realesrgan_upsampler()
+
+        rgb = np.array(img.convert("RGB"))
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+        print(f"[IsabelaOS] Applying RealESRGAN upscale x{outscale}...")
+        output, _ = upsampler.enhance(bgr, outscale=outscale)
+
+        out_rgb = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
+        out_pil = Image.fromarray(out_rgb)
+
+        print(f"[IsabelaOS] RealESRGAN upscale done ✅ size={out_pil.size}")
+        return out_pil
+
+    except Exception as e:
+        print("[IsabelaOS] WARNING: RealESRGAN upscale failed:", repr(e))
+        print(traceback.format_exc())
+        return img
+
+
 # ----------------------------
 # Helpers montaje IA
 # ----------------------------
 def _feather_alpha(alpha, feather_px: int):
-    import cv2
-
     if feather_px <= 0:
         return alpha
 
@@ -664,8 +738,6 @@ def _match_color_simple(fg_bgr, bg_bgr, mask):
     Ajuste simple de media/std por canal usando la zona de fondo cercana.
     No cambia identidad, solo ayuda a integrar color/luz.
     """
-    import cv2
-
     m = (mask > 0)
     if m.sum() < 50:
         return fg_bgr
@@ -693,8 +765,6 @@ def _match_color_simple(fg_bgr, bg_bgr, mask):
 
 
 def _add_contact_shadow(bg_bgr, mask_roi, roi_box, opacity: float = 0.18):
-    import cv2
-
     x1, y1, x2, y2 = roi_box
     out = bg_bgr.copy()
 
@@ -751,7 +821,7 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
     avatar_name = _safe_text(input_data.get("avatar_name", "")) or None
     avatar_trigger = _safe_text(input_data.get("avatar_trigger", "")) or None
 
-    # 🔥 desactivar LoRA temporalmente para probar solo anchors + face swap
+    # LoRA temporalmente desactivado para probar solo anchors + face swap
     avatar_lora_path = None
 
     avatar_anchor_urls = _safe_list(input_data.get("avatar_anchor_urls"))
@@ -788,7 +858,7 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
         },
     )
 
-    # 3) Generación base FLUX + LoRA
+    # 3) Generación base FLUX
     with torch.inference_mode():
         if DEVICE == "cuda":
             with torch.autocast("cuda", dtype=DTYPE_FLUX):
@@ -817,6 +887,9 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
             print("[IsabelaOS] Identity lock warning:", identity_warning)
         else:
             print("[IsabelaOS] Identity lock applied ✅")
+
+    # 5) Upscale final con RealESRGAN
+    image = _apply_realesrgan_upscale(image, outscale=2)
 
     enc = encode_image_jpg(image)
     return {
@@ -908,6 +981,8 @@ def handle_product_studio_premium(input_data: Dict[str, Any]) -> Dict[str, Any]:
         print("[IsabelaOS] WARNING: flat output detected; returning init image fallback.")
         out = init_img
 
+    out = _apply_realesrgan_upscale(out, outscale=2)
+
     enc = encode_image_jpg(out)
     return {
         **enc,
@@ -998,6 +1073,8 @@ def handle_transform_anime_identity(input_data: Dict[str, Any]) -> Dict[str, Any
         print("[IsabelaOS] WARNING: flat output detected; returning init image fallback.")
         out = init_img
 
+    out = _apply_realesrgan_upscale(out, outscale=2)
+
     enc = encode_image_jpg(out)
     return {
         **enc,
@@ -1028,7 +1105,6 @@ def handle_compose_scene(input_data: Dict[str, Any]) -> Dict[str, Any]:
     print("[IsabelaOS] handle_compose_scene() entered")
 
     # imports diferidos: SOLO si de verdad se usa este modo
-    import cv2
     from rembg import remove as rembg_remove
 
     fg_b64 = input_data.get("fg_image_b64") or input_data.get("person_image")
@@ -1135,6 +1211,8 @@ def handle_compose_scene(input_data: Dict[str, Any]) -> Dict[str, Any]:
     out_rgb = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2RGB)
     out_pil = Image.fromarray(out_rgb)
 
+    out_pil = _apply_realesrgan_upscale(out_pil, outscale=2)
+
     enc = encode_image_jpg(out_pil)
     return {
         **enc,
@@ -1168,7 +1246,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
 
         if action == "health":
             return {
-                "message": "IsabelaOS worker online (FLUX txt2img + SDXL img2img Product + Anime Identity + Avatar support + Compose Scene + Identity Lock)"
+                "message": "IsabelaOS worker online (FLUX txt2img + SDXL img2img Product + Anime Identity + Avatar support + Compose Scene + Identity Lock + RealESRGAN)"
             }
 
         if action in ["generate", "txt2img_flux", "generate_image", "txt2img"]:
