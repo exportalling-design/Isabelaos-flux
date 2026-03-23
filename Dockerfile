@@ -4,12 +4,21 @@ ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /workspace
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-dev \
-    git ffmpeg \
-    libsm6 libxext6 libgl1 \
+    python3 \
+    python3-pip \
+    python3-dev \
+    git \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
+    libgl1 \
+    build-essential \
+    gcc \
+    g++ \
+    cmake \
  && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install --upgrade pip
+RUN python3 -m pip install --upgrade pip setuptools wheel
 
 # Torch GPU (CUDA 12.1)
 RUN pip install --no-cache-dir \
