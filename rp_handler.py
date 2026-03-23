@@ -750,7 +750,9 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
     avatar_id = _safe_text(input_data.get("avatar_id", "")) or None
     avatar_name = _safe_text(input_data.get("avatar_name", "")) or None
     avatar_trigger = _safe_text(input_data.get("avatar_trigger", "")) or None
-    avatar_lora_path = _safe_text(input_data.get("avatar_lora_path", "")) or None
+
+    # 🔥 desactivar LoRA temporalmente para probar solo anchors + face swap
+    avatar_lora_path = None
 
     avatar_anchor_urls = _safe_list(input_data.get("avatar_anchor_urls"))
     avatar_anchor_paths = _safe_list(input_data.get("avatar_anchor_paths"))
