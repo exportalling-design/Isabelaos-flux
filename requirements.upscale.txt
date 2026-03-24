@@ -1,0 +1,8 @@
+runpod>=1.6.0
+
+numpy==1.26.4
+Pillow>=10.0.0,<12.0.0
+opencv-python-headless==4.10.0.84
+
+basicsr==1.4.2
+realesrgan==0.3.0
