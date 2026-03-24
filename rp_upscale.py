@@ -1,9 +1,8 @@
-
 import os
 import io
 import base64
 import traceback
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 import cv2
 import numpy as np
@@ -27,7 +26,6 @@ REALESRGAN_MODEL_URL = (
 )
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
 realesrgan_upsampler = None
 
 print("[IsabelaOS Upscale] Worker booting...")
@@ -76,9 +74,21 @@ def _ensure_file_from_url(url: str, local_path: str) -> str:
     return local_path
 
 
+def _strip_data_url_prefix(b64_str: str) -> str:
+    if not b64_str:
+        return b64_str
+    if "," in b64_str and b64_str.startswith("data:image"):
+        return b64_str.split(",", 1)[1]
+    return b64_str
+
+
 def decode_image(b64_str: str) -> Image.Image:
-    raw = base64.b64decode(b64_str)
-    return Image.open(io.BytesIO(raw)).convert("RGB")
+    try:
+        clean_b64 = _strip_data_url_prefix(b64_str)
+        raw = base64.b64decode(clean_b64)
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as e:
+        raise ValueError(f"INVALID_IMAGE_B64: {str(e)}")
 
 
 def encode_image_jpg(img: Image.Image, quality: int = 92) -> Dict[str, str]:
@@ -89,6 +99,7 @@ def encode_image_jpg(img: Image.Image, quality: int = 92) -> Dict[str, str]:
     data_url = "data:image/jpeg;base64," + b64
 
     return {
+        "ok": True,
         "image_b64": b64,
         "image_data_url": data_url,
         "mime": "image/jpeg",
@@ -155,7 +166,11 @@ def apply_upscale(img: Image.Image, outscale: int = 2) -> Image.Image:
 def handle_upscale(input_data: Dict[str, Any]) -> Dict[str, Any]:
     image_b64 = input_data.get("image_b64")
     if not image_b64:
-        return {"error": "MISSING_IMAGE_B64"}
+        return {
+            "ok": False,
+            "error": "MISSING_IMAGE_B64",
+            "received_keys": list(input_data.keys())
+        }
 
     outscale = _safe_int(input_data.get("outscale", 2), 2)
     if outscale not in [2, 3, 4]:
@@ -172,32 +187,65 @@ def handle_upscale(input_data: Dict[str, Any]) -> Dict[str, Any]:
         "params": {
             "outscale": outscale,
             "size": list(out.size),
+            "device": DEVICE,
         },
     }
+
+
+def _extract_input(event: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(event, dict):
+        return {}
+
+    if isinstance(event.get("input"), dict):
+        return event["input"]
+
+    # fallback por si pruebas body directo
+    return event
 
 
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     try:
         print("[IsabelaOS Upscale] handler invoked")
+        print("[IsabelaOS Upscale] raw event keys =", list(event.keys()) if isinstance(event, dict) else type(event))
 
-        input_data = event.get("input") or {}
-        action = _safe_text(input_data.get("action", "")).lower()
-
-        print("[IsabelaOS Upscale] action =", action or "(empty)")
+        input_data = _extract_input(event)
         print("[IsabelaOS Upscale] input keys =", list(input_data.keys()))
 
+        action = _safe_text(input_data.get("action", "")).lower()
+
+        # si no viene action pero sí imagen, asumimos upscale
+        if not action and input_data.get("image_b64"):
+            action = "upscale"
+
+        print("[IsabelaOS Upscale] action =", action or "(empty)")
+
         if action == "health":
-            return {"message": "IsabelaOS Upscale worker online (RealESRGAN)"}
+            return {
+                "ok": True,
+                "message": "IsabelaOS Upscale worker online (RealESRGAN)",
+                "device": DEVICE,
+                "model_path": REALESRGAN_MODEL_PATH,
+            }
 
         if action in ["upscale", "enhance", "realesrgan"]:
             return handle_upscale(input_data)
 
-        return {"error": "UNKNOWN_ACTION", "action": action}
+        return {
+            "ok": False,
+            "error": "UNKNOWN_ACTION",
+            "action": action,
+            "expected": ["health", "upscale", "enhance", "realesrgan"],
+            "received_keys": list(input_data.keys()),
+        }
 
     except Exception as e:
         print("[IsabelaOS Upscale ERROR]", repr(e))
         print(traceback.format_exc())
-        return {"error": str(e)}
+        return {
+            "ok": False,
+            "error": str(e),
+            "trace": traceback.format_exc()[:4000],
+        }
 
 
 runpod.serverless.start({"handler": handler})
