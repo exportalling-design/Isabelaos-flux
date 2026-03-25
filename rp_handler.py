@@ -789,40 +789,54 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
     engine = "flux"
 
     if use_realistic_natural:
-    print("[IsabelaOS] Using Realistic Vision for NATURAL + AVATAR")
-    pipe = get_realistic_vision()
-    engine = "realistic_vision"
+        print("[IsabelaOS] Using Realistic Vision for NATURAL + AVATAR")
+        pipe = get_realistic_vision()
+        engine = "realistic_vision"
 
-    rv_steps = int(input_data.get("natural_rv_steps", 24))
-    rv_guidance = float(input_data.get("natural_rv_guidance", 5.5))
+        rv_steps = int(input_data.get("natural_rv_steps", 24))
+        rv_guidance = float(input_data.get("natural_rv_guidance", 5.5))
 
-    rv_prompt = (
-        effective_prompt
-        + ", single person, one woman only, solo portrait, one face only, "
-          "head and shoulders, centered subject, symmetrical composition, "
-          "looking at camera, realistic portrait"
-    )
+        rv_prompt = (
+            effective_prompt
+            + ", single person, one woman only, solo portrait, one face only, "
+              "head and shoulders, centered subject, symmetrical composition, "
+              "looking at camera, realistic portrait, analog photo grain, "
+              "natural skin texture, skin blemishes, hyper-detailed pores, "
+              "subtle imperfections, unretouched skin, realistic facial texture, "
+              "cinematic natural lighting, photorealistic skin, detailed complexion"
+        )
 
-    rv_negative = (
-        negative_prompt
-        + ", multiple people, two people, group photo, duplicate face, extra face, "
-          "extra head, extra body, merged body, fused body, twins, collage, stacked bodies, "
-          "double head, cloned face, duplicated person, cropped second person"
-    )
+        rv_negative = (
+            negative_prompt
+            + ", multiple people, two people, group photo, duplicate face, extra face, "
+              "extra head, extra body, merged body, fused body, twins, collage, "
+              "stacked bodies, double head, cloned face, duplicated person, "
+              "cropped second person, plastic skin, smooth skin, waxy skin, "
+              "beauty filter, airbrushed skin, glossy skin, CGI, anime"
+        )
 
-    print(
-        "[IsabelaOS] RV prompt control:",
-        {
-            "rv_steps": rv_steps,
-            "rv_guidance": rv_guidance,
-            "rv_prompt": rv_prompt,
-            "rv_negative": rv_negative,
-        },
-    )
+        print(
+            "[IsabelaOS] RV prompt control:",
+            {
+                "rv_steps": rv_steps,
+                "rv_guidance": rv_guidance,
+                "rv_prompt": rv_prompt,
+                "rv_negative": rv_negative,
+            },
+        )
 
-    with torch.inference_mode():
-        if DEVICE == "cuda":
-            with torch.autocast("cuda", dtype=DTYPE_SD15):
+        with torch.inference_mode():
+            if DEVICE == "cuda":
+                with torch.autocast("cuda", dtype=DTYPE_SD15):
+                    image = pipe(
+                        prompt=rv_prompt,
+                        negative_prompt=rv_negative,
+                        num_inference_steps=rv_steps,
+                        guidance_scale=rv_guidance,
+                        width=width,
+                        height=height,
+                    ).images[0]
+            else:
                 image = pipe(
                     prompt=rv_prompt,
                     negative_prompt=rv_negative,
@@ -831,24 +845,7 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
                     width=width,
                     height=height,
                 ).images[0]
-        else:
-            image = pipe(
-                prompt=rv_prompt,
-                negative_prompt=rv_negative,
-                num_inference_steps=rv_steps,
-                guidance_scale=rv_guidance,
-                width=width,
-                height=height,
-            ).images[0]
-            else:
-                image = pipe(
-                    prompt=effective_prompt,
-                    negative_prompt=negative_prompt,
-                    num_inference_steps=rv_steps,
-                    guidance_scale=rv_guidance,
-                    width=width,
-                    height=height,
-                ).images[0]
+
     else:
         print("[IsabelaOS] Using FLUX pipeline")
         pipe = get_flux()
