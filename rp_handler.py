@@ -47,7 +47,7 @@ os.makedirs(ANCHOR_CACHE_DIR, exist_ok=True)
 FACE_MODELS_DIR = f"{BASE_VOLUME}/face_models"
 os.makedirs(FACE_MODELS_DIR, exist_ok=True)
 
-from diffusers import FluxPipeline, AutoPipelineForImage2Image
+from diffusers import FluxPipeline, AutoPipelineForImage2Image, UniPCMultistepScheduler
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -131,6 +131,12 @@ def get_img2img():
         use_safetensors=True,
     )
     print("[IsabelaOS] SDXL IMG2IMG loaded from pretrained ✅")
+
+    try:
+    img2img_pipe.scheduler = UniPCMultistepScheduler.from_config(img2img_pipe.scheduler.config)
+    print("[IsabelaOS] SDXL scheduler switched to UniPC ✅")
+except Exception as e:
+    print("[IsabelaOS] Could not switch SDXL scheduler to UniPC:", repr(e))
 
     try:
         img2img_pipe.safety_checker = None
@@ -484,8 +490,8 @@ def _apply_identity_lock(base_image: Image.Image, anchor_images: List[Image.Imag
 # ----------------------------
 def _refine_natural_skin(base_image: Image.Image, input_data: Dict[str, Any]) -> (Image.Image, Optional[str]):
     """
-    Refine suave con SDXL para bajar el look embellecido / plástico.
-    No debe cambiar composición ni identidad fuerte.
+    Refine suave con SDXL para bajar el look embellecido / plástico
+    sin reinterpretar demasiado el rostro.
     """
     try:
         pipe = get_img2img()
@@ -495,25 +501,29 @@ def _refine_natural_skin(base_image: Image.Image, input_data: Dict[str, Any]) ->
             base_image,
             max_side=int(input_data.get("natural_skin_max_side", 1024))
         )
+
+        # 1) Ruido MUY leve antes del refine para romper la piel "muñeca"
+        work_img = _add_subtle_sensor_noise(
+            work_img,
+            amount=float(input_data.get("natural_skin_pre_noise", 1.6))
+        )
+
         w, h = work_img.size
 
-        user_prompt = _safe_text(input_data.get("prompt", ""))
-        user_negative = _safe_text(input_data.get("negative_prompt", ""))
-
+        # Prompt corto fijo: evita truncado y evita que SDXL reinterprete demasiado
         refine_prompt = (
-            user_prompt
-            + ", natural skin texture, visible pores, subtle skin imperfections, uneven skin tone, unretouched photo"
+            "natural skin texture, visible pores, subtle skin imperfections, "
+            "uneven skin tone, unretouched photo, preserve face identity, same face"
         )
 
         refine_negative = (
-            "smooth skin, plastic skin, airbrushed skin, flawless skin, beauty filter, CGI"
+            "smooth skin, plastic skin, airbrushed skin, flawless skin, "
+            "beauty filter, glossy skin, CGI, change face, different face"
         )
-        if user_negative:
-            refine_negative = refine_negative + ", " + user_negative
 
-        steps = int(input_data.get("natural_skin_steps", 12))
-        guidance = float(input_data.get("natural_skin_guidance", 4.2))
-        strength = float(input_data.get("natural_skin_strength", 0.12))
+        steps = int(input_data.get("natural_skin_steps", 14))
+        guidance = float(input_data.get("natural_skin_guidance", 2.8))
+        strength = float(input_data.get("natural_skin_strength", 0.16))
 
         print(
             "[natural_skin_refine]",
@@ -543,7 +553,11 @@ def _refine_natural_skin(base_image: Image.Image, input_data: Dict[str, Any]) ->
         if out.size != (orig_w, orig_h):
             out = out.resize((orig_w, orig_h), Image.LANCZOS)
 
-        out = _add_subtle_sensor_noise(out, amount=float(input_data.get("natural_skin_noise", 1.75)))
+        # 2) Ruido MUY leve final para romper el acabado demasiado limpio
+        out = _add_subtle_sensor_noise(
+            out,
+            amount=float(input_data.get("natural_skin_post_noise", 1.2))
+        )
 
         return out, None
 
