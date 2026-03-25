@@ -2,13 +2,18 @@
 # FLUX txt2img + SDXL img2img Product Studio + SDXL img2img Anime Identity
 # + Avatar support
 # + Avatar anchors
-# + Identity lock (face swap) SOLO cuando hay anchors
+# + Identity lock (face swap) SOLO cuando hay avatar seleccionado
 # + compose_scene (Montaje IA local)
+#
+# IMPORTANTE:
+# - NO cambia el flujo de envío del job.
+# - NO cambia el formato de retorno.
+# - NO cambia el polling.
+# - SOLO agrega una etapa extra de identidad cuando hay avatar + anchors.
 
 import os
 import io
 import json
-import time
 import base64
 import urllib.request
 import urllib.parse
@@ -111,10 +116,6 @@ SUPABASE_AVATAR_BUCKET = os.environ.get(
     os.environ.get("AVATAR_BUCKET", "avatars"),
 )
 
-# endpoint de upscale
-RUNPOD_UPSCALE_ENDPOINT_ID = os.environ.get("RUNPOD_UPSCALE_ENDPOINT_ID", "").strip()
-RP_API_KEY = os.environ.get("RP_API_KEY", "").strip()
-
 # ----------------------------
 # Pipelines
 # ----------------------------
@@ -187,6 +188,10 @@ def get_img2img():
 # Helpers generales
 # ----------------------------
 def encode_image_jpg(img: Image.Image, quality: int = 92) -> Dict[str, str]:
+    """
+    Devuelve formato principal + aliases legacy para no romper
+    endpoints viejos que busquen otras llaves.
+    """
     buf = io.BytesIO()
     img = img.convert("RGB")
     img.save(buf, format="JPEG", quality=quality, optimize=True)
@@ -275,14 +280,6 @@ def pil_to_bgr(img: Image.Image):
 def bgr_to_pil(arr):
     rgb = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
     return Image.fromarray(rgb)
-
-
-def _strip_data_url_prefix(b64_str: str) -> str:
-    if not b64_str:
-        return b64_str
-    if "," in b64_str and b64_str.startswith("data:image"):
-        return b64_str.split(",", 1)[1]
-    return b64_str
 
 
 # ----------------------------
@@ -635,113 +632,6 @@ def _apply_identity_lock(base_image: Image.Image, anchor_images: List[Image.Imag
 
 
 # ----------------------------
-# Helpers upscale endpoint
-# ----------------------------
-def _call_upscale_endpoint_if_needed(image: Image.Image, should_upscale: bool) -> (Image.Image, Optional[str]):
-    """
-    Manda la imagen YA procesada por identity lock al endpoint de upscale.
-    Solo se usa cuando hay anchors.
-    Si falla, devuelve la imagen original y warning.
-    """
-    if not should_upscale:
-        return image, None
-
-    if not RUNPOD_UPSCALE_ENDPOINT_ID:
-        return image, "UPSCALE_SKIPPED_MISSING_ENDPOINT_ID"
-
-    if not RP_API_KEY:
-        return image, "UPSCALE_SKIPPED_MISSING_RP_API_KEY"
-
-    try:
-        payload = encode_image_jpg(image)
-        image_b64 = payload.get("image_b64") or ""
-        image_b64 = _strip_data_url_prefix(image_b64)
-
-        run_url = f"https://api.runpod.ai/v2/{RUNPOD_UPSCALE_ENDPOINT_ID}/run"
-
-        req_body = {
-            "input": {
-                "action": "upscale",
-                "outscale": 2,
-                "image_b64": image_b64,
-            }
-        }
-
-        print("[IsabelaOS] Sending image to upscale endpoint...")
-        req = urllib.request.Request(
-            run_url,
-            data=json.dumps(req_body).encode("utf-8"),
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {RP_API_KEY}",
-            },
-        )
-
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            raw = resp.read().decode("utf-8")
-            job_data = json.loads(raw)
-
-        upscale_job_id = job_data.get("id") or job_data.get("jobId") or job_data.get("requestId")
-        if not upscale_job_id:
-            return image, f"UPSCALE_NO_JOB_ID: {job_data}"
-
-        status_url = f"https://api.runpod.ai/v2/{RUNPOD_UPSCALE_ENDPOINT_ID}/status/{upscale_job_id}"
-
-        for _ in range(60):
-            status_req = urllib.request.Request(
-                status_url,
-                method="GET",
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {RP_API_KEY}",
-                },
-            )
-
-            with urllib.request.urlopen(status_req, timeout=300) as resp:
-                raw = resp.read().decode("utf-8")
-                status_data = json.loads(raw)
-
-            st = (status_data.get("status") or "").upper()
-
-            if st == "COMPLETED":
-                out = status_data.get("output") or {}
-
-                up_b64 = (
-                    out.get("image_b64")
-                    or out.get("result_b64")
-                    or out.get("resultBase64")
-                    or out.get("image")
-                    or out.get("image_base64")
-                    or None
-                )
-
-                if not up_b64:
-                    data_url = out.get("data_url") or out.get("image_data_url") or None
-                    if data_url:
-                        up_b64 = _strip_data_url_prefix(data_url)
-
-                if not up_b64:
-                    return image, f"UPSCALE_COMPLETED_BUT_NO_IMAGE: {status_data}"
-
-                up_img = decode_image(up_b64)
-                print("[IsabelaOS] Upscale applied ✅")
-                return up_img, None
-
-            if st in ["FAILED", "CANCELLED", "TIMED_OUT"]:
-                return image, f"UPSCALE_FAILED: {status_data}"
-
-            time.sleep(2)
-
-        return image, "UPSCALE_TIMEOUT"
-
-    except Exception as e:
-        print("[IsabelaOS] WARNING: upscale failed:", repr(e))
-        print(traceback.format_exc())
-        return image, f"UPSCALE_EXCEPTION: {e}"
-
-
-# ----------------------------
 # Helpers montaje IA
 # ----------------------------
 def _feather_alpha(alpha, feather_px: int):
@@ -898,25 +788,15 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
 
     print("[IsabelaOS] txt2img base generation finished ✅")
 
-    # 4) Identity lock SOLO si hay anchors
+    # 4) Identity lock SOLO si hay avatar + anchors
     identity_warning = None
-    if anchor_images:
+    if avatar_id and anchor_images:
         print("[IsabelaOS] Applying identity lock...")
         image, identity_warning = _apply_identity_lock(image, anchor_images)
         if identity_warning:
             print("[IsabelaOS] Identity lock warning:", identity_warning)
         else:
             print("[IsabelaOS] Identity lock applied ✅")
-
-    # 5) Upscale SOLO si hay anchors
-    upscale_warning = None
-    if anchor_images:
-        print("[IsabelaOS] Applying upscale after identity lock...")
-        image, upscale_warning = _call_upscale_endpoint_if_needed(image, should_upscale=True)
-        if upscale_warning:
-            print("[IsabelaOS] Upscale warning:", upscale_warning)
-        else:
-            print("[IsabelaOS] Upscale applied after identity lock ✅")
 
     enc = encode_image_jpg(image)
     return {
@@ -925,7 +805,6 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
         "engine": "flux",
         "warning": lora_info.get("warning"),
         "identity_warning": identity_warning,
-        "upscale_warning": upscale_warning,
         "avatar": {
             "id": avatar_id,
             "name": avatar_name,
@@ -936,7 +815,6 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
             "anchor_paths_count": len(avatar_anchor_paths),
             "anchor_images_loaded": len(anchor_images),
             "identity_lock_applied": identity_warning is None and bool(anchor_images),
-            "upscale_applied": upscale_warning is None and bool(anchor_images),
         },
         "params": {
             "steps": steps,
@@ -1129,6 +1007,7 @@ def handle_compose_scene(input_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     print("[IsabelaOS] handle_compose_scene() entered")
 
+    # imports diferidos: SOLO si de verdad se usa este modo
     from rembg import remove as rembg_remove
 
     fg_b64 = input_data.get("fg_image_b64") or input_data.get("person_image")
