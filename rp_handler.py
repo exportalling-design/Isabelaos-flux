@@ -502,18 +502,18 @@ def _refine_natural_skin(base_image: Image.Image, input_data: Dict[str, Any]) ->
 
         refine_prompt = (
             user_prompt
-            + ", realistic human skin texture, visible pores, subtle natural imperfections, slight uneven skin tone, natural body skin, unretouched photo, documentary realism, non airbrushed skin"
+            + ", natural skin texture, visible pores, subtle skin imperfections, uneven skin tone, unretouched photo"
         )
 
         refine_negative = (
-            "smooth skin, plastic skin, airbrushed skin, flawless skin, beauty filter, glossy skin, perfect body, CGI"
+            "smooth skin, plastic skin, airbrushed skin, flawless skin, beauty filter, CGI"
         )
         if user_negative:
             refine_negative = refine_negative + ", " + user_negative
 
-        steps = int(input_data.get("natural_skin_steps", 20))
-        guidance = float(input_data.get("natural_skin_guidance", 5.8))
-        strength = float(input_data.get("natural_skin_strength", 0.22))
+        steps = int(input_data.get("natural_skin_steps", 12))
+        guidance = float(input_data.get("natural_skin_guidance", 4.2))
+        strength = float(input_data.get("natural_skin_strength", 0.12))
 
         print(
             "[natural_skin_refine]",
