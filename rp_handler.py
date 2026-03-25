@@ -1,7 +1,7 @@
 # rp_handler.py – IsabelaOS Studio
 # FLUX txt2img + anchors + identity lock (InsightFace / FaceSwap)
 # + compose_scene (Montaje IA local)
-# + skin_mode natural (SDXL refine suave para piel más real)
+# + skin_mode natural con Realistic Vision cuando hay avatar/anchor
 
 import os
 import io
@@ -47,7 +47,13 @@ os.makedirs(ANCHOR_CACHE_DIR, exist_ok=True)
 FACE_MODELS_DIR = f"{BASE_VOLUME}/face_models"
 os.makedirs(FACE_MODELS_DIR, exist_ok=True)
 
-from diffusers import FluxPipeline, AutoPipelineForImage2Image, UniPCMultistepScheduler
+from diffusers import (
+    FluxPipeline,
+    AutoPipelineForImage2Image,
+    UniPCMultistepScheduler,
+    StableDiffusionPipeline,
+    AutoencoderKL,
+)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -57,9 +63,14 @@ DTYPE_SDXL = (
     if (DEVICE == "cuda" and torch.cuda.is_bf16_supported())
     else (torch.float16 if DEVICE == "cuda" else torch.float32)
 )
+DTYPE_SD15 = torch.float16 if DEVICE == "cuda" else torch.float32
 
 FLUX_MODEL_ID = "black-forest-labs/FLUX.1-schnell"
 SDXL_IMG2IMG_ID = os.environ.get("SDXL_IMG2IMG_ID", "stabilityai/stable-diffusion-xl-base-1.0")
+
+# Realistic Vision para skin_mode natural + avatar
+REALISTIC_MODEL_ID = os.environ.get("REALISTIC_MODEL_ID", "SG161222/Realistic_Vision_V5.1_noVAE")
+REALISTIC_VAE_ID = os.environ.get("REALISTIC_VAE_ID", "stabilityai/sd-vae-ft-mse-original")
 
 # Modelo de face swap
 INSWAPPER_MODEL_PATH = f"{FACE_MODELS_DIR}/inswapper_128.onnx"
@@ -70,6 +81,7 @@ INSWAPPER_MODEL_URL = os.environ.get(
 
 flux_pipe: Optional[FluxPipeline] = None
 img2img_pipe = None
+realistic_pipe = None
 
 # insightface (lazy load)
 face_analyser = None
@@ -88,6 +100,7 @@ print("[IsabelaOS] Worker booting...")
 print("[IsabelaOS] DEVICE =", DEVICE)
 print("[IsabelaOS] DTYPE_FLUX =", DTYPE_FLUX)
 print("[IsabelaOS] DTYPE_SDXL =", DTYPE_SDXL)
+print("[IsabelaOS] DTYPE_SD15 =", DTYPE_SD15)
 print("[IsabelaOS] BASE_VOLUME =", BASE_VOLUME)
 
 # ----------------------------
@@ -162,6 +175,60 @@ def get_img2img():
             pass
 
     return img2img_pipe
+
+
+def get_realistic_vision():
+    global realistic_pipe
+
+    if realistic_pipe is not None:
+        print("[IsabelaOS] Realistic Vision already loaded ✅")
+        return realistic_pipe
+
+    print("[IsabelaOS] Loading Realistic Vision pipeline...")
+    realistic_pipe = StableDiffusionPipeline.from_pretrained(
+        REALISTIC_MODEL_ID,
+        torch_dtype=DTYPE_SD15,
+        cache_dir=os.environ["HF_HUB_CACHE"],
+        safety_checker=None,
+        requires_safety_checker=False,
+    )
+    print("[IsabelaOS] Realistic Vision loaded from pretrained ✅")
+
+    try:
+        print("[IsabelaOS] Loading Realistic Vision VAE...")
+        vae = AutoencoderKL.from_pretrained(
+            REALISTIC_VAE_ID,
+            torch_dtype=DTYPE_SD15,
+            cache_dir=os.environ["HF_HUB_CACHE"],
+        )
+        realistic_pipe.vae = vae
+        print("[IsabelaOS] Realistic Vision VAE loaded ✅")
+    except Exception as e:
+        print("[IsabelaOS] Could not load Realistic Vision VAE:", repr(e))
+
+    try:
+        realistic_pipe.scheduler = UniPCMultistepScheduler.from_config(realistic_pipe.scheduler.config)
+        print("[IsabelaOS] Realistic Vision scheduler switched to UniPC ✅")
+    except Exception as e:
+        print("[IsabelaOS] Could not switch Realistic Vision scheduler to UniPC:", repr(e))
+
+    try:
+        realistic_pipe.safety_checker = None
+        realistic_pipe.requires_safety_checker = False
+    except Exception as e:
+        print("[IsabelaOS] Could not disable Realistic Vision safety checker:", repr(e))
+
+    if DEVICE == "cuda":
+        print("[IsabelaOS] Moving Realistic Vision to CUDA...")
+        realistic_pipe = realistic_pipe.to("cuda")
+        print("[IsabelaOS] Realistic Vision moved to CUDA ✅")
+
+        try:
+            realistic_pipe.enable_attention_slicing()
+        except Exception:
+            pass
+
+    return realistic_pipe
 
 
 # ----------------------------
@@ -510,7 +577,6 @@ def _refine_natural_skin(base_image: Image.Image, input_data: Dict[str, Any]) ->
 
         w, h = work_img.size
 
-        # Prompt corto fijo: evita truncado y evita que SDXL reinterprete demasiado
         refine_prompt = (
             "natural skin texture, visible pores, subtle skin imperfections, "
             "uneven skin tone, unretouched photo, preserve face identity, same face"
@@ -536,14 +602,13 @@ def _refine_natural_skin(base_image: Image.Image, input_data: Dict[str, Any]) ->
         )
 
         def _add_pre_refine_noise(img, amount=0.015):
-            import numpy as np
             arr = np.array(img).astype(np.float32)
             noise = np.random.normal(0, amount * 255, arr.shape)
             arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
             return Image.fromarray(arr)
 
         work_img = _add_pre_refine_noise(work_img, 0.015)
-        
+
         with torch.inference_mode():
             out = pipe(
                 prompt=refine_prompt,
@@ -662,8 +727,6 @@ def _add_contact_shadow(bg_bgr, mask_roi, roi_box, opacity: float = 0.18):
 def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
     print("[IsabelaOS] handle_txt2img() entered")
 
-    pipe = get_flux()
-
     prompt = _safe_text(input_data.get("prompt", ""))
     effective_prompt = _safe_text(input_data.get("effective_prompt", "")) or prompt
     negative_prompt = _safe_text(input_data.get("negative_prompt", ""))
@@ -687,8 +750,11 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             print("[IsabelaOS] WARNING: anchor loading failed:", repr(e))
 
+    has_avatar_anchor = bool(avatar_id and anchor_images)
+    use_realistic_natural = bool(has_avatar_anchor and skin_mode == "natural")
+
     print(
-        "[txt2img_flux]",
+        "[txt2img_pipeline]",
         {
             "prompt": prompt,
             "effective_prompt": effective_prompt,
@@ -702,32 +768,69 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
             "avatar_anchor_urls_count": len(avatar_anchor_urls),
             "avatar_anchor_paths_count": len(avatar_anchor_paths),
             "anchor_images_loaded": len(anchor_images),
+            "has_avatar_anchor": has_avatar_anchor,
+            "use_realistic_natural": use_realistic_natural,
         },
     )
 
-    # 2) Generación base FLUX
-    with torch.inference_mode():
-        if DEVICE == "cuda":
-            with torch.autocast("cuda", dtype=DTYPE_FLUX):
+    # 2) Generación base
+    engine = "flux"
+
+    if use_realistic_natural:
+        print("[IsabelaOS] Using Realistic Vision for NATURAL + AVATAR")
+        pipe = get_realistic_vision()
+        engine = "realistic_vision"
+
+        rv_steps = int(input_data.get("natural_rv_steps", 28))
+        rv_guidance = float(input_data.get("natural_rv_guidance", 6.5))
+
+        with torch.inference_mode():
+            if DEVICE == "cuda":
+                with torch.autocast("cuda", dtype=DTYPE_SD15):
+                    image = pipe(
+                        prompt=effective_prompt,
+                        negative_prompt=negative_prompt,
+                        num_inference_steps=rv_steps,
+                        guidance_scale=rv_guidance,
+                        width=width,
+                        height=height,
+                    ).images[0]
+            else:
+                image = pipe(
+                    prompt=effective_prompt,
+                    negative_prompt=negative_prompt,
+                    num_inference_steps=rv_steps,
+                    guidance_scale=rv_guidance,
+                    width=width,
+                    height=height,
+                ).images[0]
+    else:
+        print("[IsabelaOS] Using FLUX pipeline")
+        pipe = get_flux()
+        engine = "flux"
+
+        with torch.inference_mode():
+            if DEVICE == "cuda":
+                with torch.autocast("cuda", dtype=DTYPE_FLUX):
+                    image = pipe(
+                        prompt=effective_prompt,
+                        num_inference_steps=steps,
+                        width=width,
+                        height=height,
+                    ).images[0]
+            else:
                 image = pipe(
                     prompt=effective_prompt,
                     num_inference_steps=steps,
                     width=width,
                     height=height,
                 ).images[0]
-        else:
-            image = pipe(
-                prompt=effective_prompt,
-                num_inference_steps=steps,
-                width=width,
-                height=height,
-            ).images[0]
 
     print("[IsabelaOS] txt2img base generation finished ✅")
 
     # 3) Identity lock SOLO si hay avatar + anchors
     identity_warning = None
-    if avatar_id and anchor_images:
+    if has_avatar_anchor:
         print("[IsabelaOS] Applying identity lock...")
         image, identity_warning = _apply_identity_lock(image, anchor_images)
         if identity_warning:
@@ -736,9 +839,10 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
             print("[IsabelaOS] Identity lock applied ✅")
 
     # 4) Skin natural refine
+    # Solo se usa el refine viejo cuando skin_mode=natural PERO no entró al flujo Realistic Vision + avatar.
     natural_skin_warning = None
-    if skin_mode == "natural":
-        print("[IsabelaOS] Applying natural skin refine...")
+    if skin_mode == "natural" and not use_realistic_natural and not has_avatar_anchor:
+        print("[IsabelaOS] Applying natural skin refine (no avatar fallback)...")
         image, natural_skin_warning = _refine_natural_skin(image, input_data)
         if natural_skin_warning:
             print("[IsabelaOS] Natural skin warning:", natural_skin_warning)
@@ -749,7 +853,7 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
     return {
         **enc,
         "mode": "txt2img_flux",
-        "engine": "flux",
+        "engine": engine,
         "identity_warning": identity_warning,
         "natural_skin_warning": natural_skin_warning,
         "avatar": {
@@ -765,6 +869,7 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
             "size": [width, height],
             "used_effective_prompt": bool(effective_prompt),
             "skin_mode": skin_mode,
+            "use_realistic_natural": use_realistic_natural,
         },
     }
 
@@ -918,7 +1023,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
 
         if action == "health":
             return {
-                "message": "IsabelaOS worker online (FLUX txt2img + anchors + identity lock + natural skin + compose scene)"
+                "message": "IsabelaOS worker online (FLUX / Realistic Vision + anchors + identity lock + natural skin + compose scene)"
             }
 
         if action in ["generate", "txt2img_flux", "generate_image", "txt2img"]:
