@@ -730,6 +730,16 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
     prompt = _safe_text(input_data.get("prompt", ""))
     effective_prompt = _safe_text(input_data.get("effective_prompt", "")) or prompt
     negative_prompt = _safe_text(input_data.get("negative_prompt", ""))
+    if "across frames" in effective_prompt.lower():
+        effective_prompt = effective_prompt.replace("across frames", "")
+    if "frame skipping" in effective_prompt.lower():
+        effective_prompt = effective_prompt.replace("frame skipping", "")
+    if "motion artifacts" in effective_prompt.lower():
+        effective_prompt = effective_prompt.replace("motion artifacts", "")
+    if "gentle blinking" in effective_prompt.lower():
+        effective_prompt = effective_prompt.replace("gentle blinking", "")
+    if "temporal wobble" in effective_prompt.lower():
+        effective_prompt = effective_prompt.replace("temporal wobble", "")
     skin_mode = _safe_text(input_data.get("skin_mode", "standard")).lower() or "standard"
 
     steps = int(input_data.get("steps", 4))
@@ -777,24 +787,57 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
     engine = "flux"
 
     if use_realistic_natural:
-        print("[IsabelaOS] Using Realistic Vision for NATURAL + AVATAR")
-        pipe = get_realistic_vision()
-        engine = "realistic_vision"
+    print("[IsabelaOS] Using Realistic Vision for NATURAL + AVATAR")
+    pipe = get_realistic_vision()
+    engine = "realistic_vision"
 
-        rv_steps = int(input_data.get("natural_rv_steps", 28))
-        rv_guidance = float(input_data.get("natural_rv_guidance", 6.5))
+    rv_steps = int(input_data.get("natural_rv_steps", 24))
+    rv_guidance = float(input_data.get("natural_rv_guidance", 5.5))
 
-        with torch.inference_mode():
-            if DEVICE == "cuda":
-                with torch.autocast("cuda", dtype=DTYPE_SD15):
-                    image = pipe(
-                        prompt=effective_prompt,
-                        negative_prompt=negative_prompt,
-                        num_inference_steps=rv_steps,
-                        guidance_scale=rv_guidance,
-                        width=width,
-                        height=height,
-                    ).images[0]
+    rv_prompt = (
+        effective_prompt
+        + ", single person, one woman only, solo portrait, one face only, "
+          "head and shoulders, centered subject, symmetrical composition, "
+          "looking at camera, realistic portrait"
+    )
+
+    rv_negative = (
+        negative_prompt
+        + ", multiple people, two people, group photo, duplicate face, extra face, "
+          "extra head, extra body, merged body, fused body, twins, collage, stacked bodies, "
+          "double head, cloned face, duplicated person, cropped second person"
+    )
+
+    print(
+        "[IsabelaOS] RV prompt control:",
+        {
+            "rv_steps": rv_steps,
+            "rv_guidance": rv_guidance,
+            "rv_prompt": rv_prompt,
+            "rv_negative": rv_negative,
+        },
+    )
+
+    with torch.inference_mode():
+        if DEVICE == "cuda":
+            with torch.autocast("cuda", dtype=DTYPE_SD15):
+                image = pipe(
+                    prompt=rv_prompt,
+                    negative_prompt=rv_negative,
+                    num_inference_steps=rv_steps,
+                    guidance_scale=rv_guidance,
+                    width=width,
+                    height=height,
+                ).images[0]
+        else:
+            image = pipe(
+                prompt=rv_prompt,
+                negative_prompt=rv_negative,
+                num_inference_steps=rv_steps,
+                guidance_scale=rv_guidance,
+                width=width,
+                height=height,
+            ).images[0]
             else:
                 image = pipe(
                     prompt=effective_prompt,
