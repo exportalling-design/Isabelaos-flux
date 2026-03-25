@@ -1,23 +1,14 @@
-
 # rp_handler.py – IsabelaOS Studio
-# FLUX txt2img + SDXL img2img Product Studio + SDXL img2img Anime Identity
-# + Avatar support
-# + Avatar anchors
-# + Identity lock (face swap) SOLO cuando hay avatar seleccionado
+# FLUX txt2img + anchors + identity lock (InsightFace / FaceSwap)
 # + compose_scene (Montaje IA local)
-#
-# IMPORTANTE:
-# - NO cambia el flujo de envío del job.
-# - NO cambia el formato de retorno.
-# - NO cambia el polling.
-# - SOLO agrega una etapa extra de identidad cuando hay avatar + anchors.
+# + skin_mode natural (SDXL refine suave para piel más real)
 
 import os
 import io
 import json
+import time
 import base64
 import urllib.request
-import urllib.parse
 import traceback
 import hashlib
 from typing import Dict, Any, Optional, List
@@ -47,10 +38,6 @@ for p in [
     os.environ["TORCH_HOME"],
 ]:
     os.makedirs(p, exist_ok=True)
-
-# cache local para LoRAs de avatar
-LORA_CACHE_DIR = f"{BASE_VOLUME}/avatar_loras"
-os.makedirs(LORA_CACHE_DIR, exist_ok=True)
 
 # cache local para anchors de avatar
 ANCHOR_CACHE_DIR = f"{BASE_VOLUME}/avatar_anchors"
@@ -88,10 +75,6 @@ img2img_pipe = None
 face_analyser = None
 face_swapper = None
 
-# estado de LoRA actual cargado en FLUX
-current_flux_lora_path: Optional[str] = None
-current_flux_adapter_name: Optional[str] = None
-
 
 def _set_torch_tweaks():
     if DEVICE == "cuda":
@@ -106,16 +89,6 @@ print("[IsabelaOS] DEVICE =", DEVICE)
 print("[IsabelaOS] DTYPE_FLUX =", DTYPE_FLUX)
 print("[IsabelaOS] DTYPE_SDXL =", DTYPE_SDXL)
 print("[IsabelaOS] BASE_VOLUME =", BASE_VOLUME)
-
-# ----------------------------
-# Env helpers
-# ----------------------------
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-SUPABASE_AVATAR_BUCKET = os.environ.get(
-    "SUPABASE_AVATAR_BUCKET",
-    os.environ.get("AVATAR_BUCKET", "avatars"),
-)
 
 # ----------------------------
 # Pipelines
@@ -216,7 +189,7 @@ def decode_image(b64_str: str) -> Image.Image:
     return Image.open(io.BytesIO(raw)).convert("RGB")
 
 
-def clamp_size(img: Image.Image, max_side: int = 768) -> Image.Image:
+def clamp_size(img: Image.Image, max_side: int = 1024) -> Image.Image:
     w, h = img.size
     scale = min(max_side / max(w, h), 1.0)
     nw = int((w * scale) // 8 * 8)
@@ -283,141 +256,15 @@ def bgr_to_pil(arr):
     return Image.fromarray(rgb)
 
 
-# ----------------------------
-# Helpers avatar LoRA
-# ----------------------------
-def _normalize_storage_path(path: str) -> str:
-    p = _safe_text(path, max_len=2000).lstrip("/")
-    bucket_prefix = f"{SUPABASE_AVATAR_BUCKET}/"
-    if p.startswith(bucket_prefix):
-        p = p[len(bucket_prefix):]
-    return p
-
-
-def _make_local_lora_cache_path(storage_path: str) -> str:
-    normalized = _normalize_storage_path(storage_path)
-    safe_name = normalized.replace("/", "__")
-    return os.path.join(LORA_CACHE_DIR, safe_name)
-
-
-def _create_supabase_signed_download_url(storage_path: str, expires_in: int = 3600) -> str:
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in worker env")
-
-    normalized_path = _normalize_storage_path(storage_path)
-    encoded_path = urllib.parse.quote(normalized_path, safe="/")
-
-    url = f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_AVATAR_BUCKET}/{encoded_path}"
-
-    payload = json.dumps({"expiresIn": expires_in}).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "apikey": SUPABASE_SERVICE_ROLE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        },
-    )
-
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        raw = resp.read().decode("utf-8")
-        data = json.loads(raw)
-
-    signed_part = data.get("signedURL") or data.get("signedUrl")
-    if not signed_part:
-        raise RuntimeError(f"Could not create signed URL for {normalized_path}: {data}")
-
-    if signed_part.startswith("http://") or signed_part.startswith("https://"):
-        return signed_part
-
-    return f"{SUPABASE_URL}/storage/v1{signed_part}"
-
-
-def _download_avatar_lora_to_cache(storage_path: str) -> str:
-    local_path = _make_local_lora_cache_path(storage_path)
-
-    if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
-        print(f"[IsabelaOS] Avatar LoRA already cached: {local_path}")
-        return local_path
-
-    signed_url = _create_supabase_signed_download_url(storage_path)
-    print(f"[IsabelaOS] Downloading avatar LoRA from Supabase: {storage_path}")
-
-    tmp_path = local_path + ".tmp"
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-
-    with urllib.request.urlopen(signed_url, timeout=120) as resp, open(tmp_path, "wb") as f:
-        while True:
-            chunk = resp.read(1024 * 1024)
-            if not chunk:
-                break
-            f.write(chunk)
-
-    os.replace(tmp_path, local_path)
-    print(f"[IsabelaOS] Avatar LoRA cached at: {local_path}")
-    return local_path
-
-
-def _unload_flux_lora_if_any(pipe) -> None:
-    global current_flux_lora_path, current_flux_adapter_name
-
-    try:
-        if hasattr(pipe, "unload_lora_weights"):
-            pipe.unload_lora_weights()
-            print("[IsabelaOS] Previous FLUX LoRA unloaded")
-    except Exception as e:
-        print("[IsabelaOS] Could not unload previous FLUX LoRA:", repr(e))
-
-    current_flux_lora_path = None
-    current_flux_adapter_name = None
-
-
-def _ensure_flux_avatar_lora(pipe, avatar_lora_path: Optional[str], avatar_id: Optional[str]) -> Dict[str, Any]:
-    global current_flux_lora_path, current_flux_adapter_name
-
-    if not avatar_lora_path:
-        if current_flux_lora_path:
-            _unload_flux_lora_if_any(pipe)
-        return {"used_lora": False, "warning": None}
-
-    try:
-        local_lora_file = _download_avatar_lora_to_cache(avatar_lora_path)
-
-        if current_flux_lora_path == local_lora_file:
-            print("[IsabelaOS] Same avatar LoRA already loaded in FLUX")
-            return {"used_lora": True, "warning": None}
-
-        if current_flux_lora_path and current_flux_lora_path != local_lora_file:
-            _unload_flux_lora_if_any(pipe)
-
-        adapter_name = f"avatar_{avatar_id or 'default'}"
-
-        print(f"[IsabelaOS] Loading avatar LoRA into FLUX: {local_lora_file}")
-
-        pipe.load_lora_weights(
-            os.path.dirname(local_lora_file),
-            weight_name=os.path.basename(local_lora_file),
-            adapter_name=adapter_name,
-        )
-
-        try:
-            if hasattr(pipe, "set_adapters"):
-                pipe.set_adapters([adapter_name], adapter_weights=[1.0])
-        except Exception as e:
-            print("[IsabelaOS] Could not set adapter weights:", repr(e))
-
-        current_flux_lora_path = local_lora_file
-        current_flux_adapter_name = adapter_name
-
-        print("[IsabelaOS] Avatar LoRA loaded successfully")
-        return {"used_lora": True, "warning": None}
-
-    except Exception as e:
-        warn = f"AVATAR_LORA_LOAD_FAILED: {e}"
-        print("[IsabelaOS] WARNING:", warn)
-        return {"used_lora": False, "warning": warn}
+def _add_subtle_sensor_noise(img: Image.Image, amount: float = 2.0) -> Image.Image:
+    """
+    Pequeño ruido para romper el look demasiado limpio.
+    Muy sutil para no destruir identidad.
+    """
+    arr = np.array(img.convert("RGB")).astype(np.float32)
+    noise = np.random.normal(0, amount, arr.shape).astype(np.float32)
+    arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr)
 
 
 # ----------------------------
@@ -633,6 +480,80 @@ def _apply_identity_lock(base_image: Image.Image, anchor_images: List[Image.Imag
 
 
 # ----------------------------
+# Helpers natural skin refine
+# ----------------------------
+def _refine_natural_skin(base_image: Image.Image, input_data: Dict[str, Any]) -> (Image.Image, Optional[str]):
+    """
+    Refine suave con SDXL para bajar el look embellecido / plástico.
+    No debe cambiar composición ni identidad fuerte.
+    """
+    try:
+        pipe = get_img2img()
+
+        orig_w, orig_h = base_image.size
+        work_img = clamp_size(
+            base_image,
+            max_side=int(input_data.get("natural_skin_max_side", 1024))
+        )
+        w, h = work_img.size
+
+        user_prompt = _safe_text(input_data.get("prompt", ""))
+        user_negative = _safe_text(input_data.get("negative_prompt", ""))
+
+        refine_prompt = (
+            user_prompt
+            + ", realistic human skin texture, visible pores, subtle natural imperfections, slight uneven skin tone, natural body skin, unretouched photo, documentary realism, non airbrushed skin"
+        )
+
+        refine_negative = (
+            "smooth skin, plastic skin, airbrushed skin, flawless skin, beauty filter, glossy skin, perfect body, CGI"
+        )
+        if user_negative:
+            refine_negative = refine_negative + ", " + user_negative
+
+        steps = int(input_data.get("natural_skin_steps", 20))
+        guidance = float(input_data.get("natural_skin_guidance", 5.8))
+        strength = float(input_data.get("natural_skin_strength", 0.22))
+
+        print(
+            "[natural_skin_refine]",
+            {
+                "steps": steps,
+                "guidance": guidance,
+                "strength": strength,
+                "size": [w, h],
+            },
+        )
+
+        with torch.inference_mode():
+            out = pipe(
+                prompt=refine_prompt,
+                negative_prompt=refine_negative,
+                image=work_img,
+                strength=strength,
+                guidance_scale=guidance,
+                num_inference_steps=steps,
+                width=w,
+                height=h,
+            ).images[0]
+
+        if is_flat_or_suspicious(out):
+            return base_image, "NATURAL_SKIN_FLAT_OUTPUT"
+
+        if out.size != (orig_w, orig_h):
+            out = out.resize((orig_w, orig_h), Image.LANCZOS)
+
+        out = _add_subtle_sensor_noise(out, amount=float(input_data.get("natural_skin_noise", 1.75)))
+
+        return out, None
+
+    except Exception as e:
+        print("[IsabelaOS] WARNING: natural skin refine failed:", repr(e))
+        print(traceback.format_exc())
+        return base_image, f"NATURAL_SKIN_FAILED: {e}"
+
+
+# ----------------------------
 # Helpers montaje IA
 # ----------------------------
 def _feather_alpha(alpha, feather_px: int):
@@ -723,6 +644,7 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
     prompt = _safe_text(input_data.get("prompt", ""))
     effective_prompt = _safe_text(input_data.get("effective_prompt", "")) or prompt
     negative_prompt = _safe_text(input_data.get("negative_prompt", ""))
+    skin_mode = _safe_text(input_data.get("skin_mode", "standard")).lower() or "standard"
 
     steps = int(input_data.get("steps", 4))
     width = int(input_data.get("width", 1024))
@@ -730,18 +652,11 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
 
     avatar_id = _safe_text(input_data.get("avatar_id", "")) or None
     avatar_name = _safe_text(input_data.get("avatar_name", "")) or None
-    avatar_trigger = _safe_text(input_data.get("avatar_trigger", "")) or None
-
-    # LoRA temporalmente desactivado para probar solo anchors + face swap
-    avatar_lora_path = None
 
     avatar_anchor_urls = _safe_list(input_data.get("avatar_anchor_urls"))
     avatar_anchor_paths = _safe_list(input_data.get("avatar_anchor_paths"))
 
-    # 1) Cargar LoRA si hay avatar
-    lora_info = _ensure_flux_avatar_lora(pipe, avatar_lora_path, avatar_id)
-
-    # 2) Cargar anchors si existen
+    # 1) Cargar anchors si existen
     anchor_images = []
     if avatar_anchor_urls:
         try:
@@ -755,21 +670,19 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
             "prompt": prompt,
             "effective_prompt": effective_prompt,
             "negative_prompt": negative_prompt,
+            "skin_mode": skin_mode,
             "steps": steps,
             "width": width,
             "height": height,
             "avatar_id": avatar_id,
             "avatar_name": avatar_name,
-            "avatar_trigger": avatar_trigger,
-            "avatar_lora_path": avatar_lora_path,
             "avatar_anchor_urls_count": len(avatar_anchor_urls),
             "avatar_anchor_paths_count": len(avatar_anchor_paths),
             "anchor_images_loaded": len(anchor_images),
-            "used_lora": lora_info.get("used_lora"),
         },
     )
 
-    # 3) Generación base FLUX
+    # 2) Generación base FLUX
     with torch.inference_mode():
         if DEVICE == "cuda":
             with torch.autocast("cuda", dtype=DTYPE_FLUX):
@@ -789,7 +702,7 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
 
     print("[IsabelaOS] txt2img base generation finished ✅")
 
-    # 4) Identity lock SOLO si hay avatar + anchors
+    # 3) Identity lock SOLO si hay avatar + anchors
     identity_warning = None
     if avatar_id and anchor_images:
         print("[IsabelaOS] Applying identity lock...")
@@ -799,19 +712,26 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
         else:
             print("[IsabelaOS] Identity lock applied ✅")
 
+    # 4) Skin natural refine
+    natural_skin_warning = None
+    if skin_mode == "natural":
+        print("[IsabelaOS] Applying natural skin refine...")
+        image, natural_skin_warning = _refine_natural_skin(image, input_data)
+        if natural_skin_warning:
+            print("[IsabelaOS] Natural skin warning:", natural_skin_warning)
+        else:
+            print("[IsabelaOS] Natural skin refine applied ✅")
+
     enc = encode_image_jpg(image)
     return {
         **enc,
         "mode": "txt2img_flux",
         "engine": "flux",
-        "warning": lora_info.get("warning"),
         "identity_warning": identity_warning,
+        "natural_skin_warning": natural_skin_warning,
         "avatar": {
             "id": avatar_id,
             "name": avatar_name,
-            "trigger": avatar_trigger,
-            "lora_path": avatar_lora_path,
-            "used_lora": lora_info.get("used_lora", False),
             "anchor_urls_count": len(avatar_anchor_urls),
             "anchor_paths_count": len(avatar_anchor_paths),
             "anchor_images_loaded": len(anchor_images),
@@ -821,186 +741,14 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
             "steps": steps,
             "size": [width, height],
             "used_effective_prompt": bool(effective_prompt),
-        },
-    }
-
-
-def handle_product_studio_premium(input_data: Dict[str, Any]) -> Dict[str, Any]:
-    pipe = get_img2img()
-
-    if not input_data.get("image_b64"):
-        return {"error": "MISSING_IMAGE_B64"}
-
-    init_img = decode_image(input_data["image_b64"])
-    init_img = clamp_size(init_img, max_side=int(input_data.get("max_side", 768)))
-    w, h = init_img.size
-
-    user_prompt = _safe_text(input_data.get("prompt"))
-    user_negative = _safe_text(input_data.get("negative_prompt"))
-
-    default_prompt = (
-        "commercial product photography, professional studio lighting, softbox lighting, "
-        "soft natural shadow under the product, clean seamless white background, "
-        "high-end e-commerce photo, realistic texture detail, sharp focus, color accurate, "
-        "premium advertising photo, minimal composition"
-    )
-    default_negative = (
-        "text, watermark, logo, extra objects, clutter, messy background, "
-        "low quality, blurry, distorted shape, oversharpen, cartoon, anime, unrealistic lighting"
-    )
-
-    prompt = user_prompt if user_prompt else default_prompt
-    negative = default_negative + (", " + user_negative if user_negative else "")
-
-    steps = int(input_data.get("steps", 30))
-    guidance = float(input_data.get("guidance", 6.5))
-    strength = float(input_data.get("strength", 0.38))
-    seed = input_data.get("seed", None)
-
-    generator = None
-    if seed is not None:
-        try:
-            seed = int(seed)
-            generator = torch.Generator(device=("cuda" if DEVICE == "cuda" else "cpu")).manual_seed(seed)
-        except Exception:
-            generator = None
-
-    print(
-        f"[product_studio_premium] size={w}x{h} steps={steps} guidance={guidance} strength={strength} dtype={DTYPE_SDXL} "
-        f"prompt_user={'yes' if bool(user_prompt) else 'no'}"
-    )
-
-    with torch.inference_mode():
-        out = pipe(
-            prompt=prompt,
-            negative_prompt=negative,
-            image=init_img,
-            strength=strength,
-            guidance_scale=guidance,
-            num_inference_steps=steps,
-            width=w,
-            height=h,
-            generator=generator,
-        ).images[0]
-
-    warning = None
-    if is_flat_or_suspicious(out):
-        warning = "SUSPICIOUS_FLAT_OUTPUT_FALLBACK_TO_INIT"
-        print("[IsabelaOS] WARNING: flat output detected; returning init image fallback.")
-        out = init_img
-
-    enc = encode_image_jpg(out)
-    return {
-        **enc,
-        "mode": "product_studio_premium",
-        "engine": "sdxl_img2img",
-        "warning": warning,
-        "params": {
-            "steps": steps,
-            "guidance": guidance,
-            "strength": strength,
-            "seed": seed,
-            "size": [w, h],
-            "dtype_sdxl": str(DTYPE_SDXL),
-            "vae_fp32": True,
-            "used_user_prompt": bool(user_prompt),
-        },
-    }
-
-
-def handle_transform_anime_identity(input_data: Dict[str, Any]) -> Dict[str, Any]:
-    pipe = get_img2img()
-
-    if not input_data.get("image_b64"):
-        return {"error": "MISSING_IMAGE_B64"}
-
-    init_img = decode_image(input_data["image_b64"])
-    init_img = clamp_size(init_img, max_side=int(input_data.get("max_side", 768)))
-    w, h = init_img.size
-
-    user_prompt = _safe_text(input_data.get("prompt"))
-    user_negative = _safe_text(input_data.get("negative_prompt"))
-
-    default_prompt = (
-        "high detail anime portrait, cinematic lighting, dramatic rim light, "
-        "sharp eyes, preserve facial identity, preserve facial proportions, "
-        "same facial structure, same expression, same hairstyle, "
-        "anime style but realistic proportions, clean high-quality render, "
-        "soft glow, ultra detailed face, smooth skin shading, "
-        "dynamic colorful background, studio quality, trending anime art style"
-    )
-
-    default_negative = (
-        "different person, unrecognizable face, identity change, face swap, "
-        "deformed face, distorted features, asymmetrical eyes, extra eyes, "
-        "bad anatomy, low quality, blurry, jpeg artifacts, "
-        "creepy, melted face, warped head, "
-        "text, watermark, logo"
-    )
-
-    prompt = user_prompt if user_prompt else default_prompt
-    prompt = prompt + ", same person, preserve identity, same face, same facial structure"
-    negative = default_negative + (", " + user_negative if user_negative else "")
-
-    steps = int(input_data.get("steps", 32))
-    guidance = float(input_data.get("guidance", 7.5))
-    strength = float(input_data.get("strength", 0.55))
-    seed = input_data.get("seed", None)
-
-    generator = None
-    if seed is not None:
-        try:
-            seed = int(seed)
-            generator = torch.Generator(device=("cuda" if DEVICE == "cuda" else "cpu")).manual_seed(seed)
-        except Exception:
-            generator = None
-
-    print(
-        f"[anime_identity] size={w}x{h} steps={steps} guidance={guidance} strength={strength} dtype={DTYPE_SDXL} "
-        f"prompt_user={'yes' if bool(user_prompt) else 'no'}"
-    )
-
-    with torch.inference_mode():
-        out = pipe(
-            prompt=prompt,
-            negative_prompt=negative,
-            image=init_img,
-            strength=strength,
-            guidance_scale=guidance,
-            num_inference_steps=steps,
-            width=w,
-            height=h,
-            generator=generator,
-        ).images[0]
-
-    warning = None
-    if is_flat_or_suspicious(out):
-        warning = "SUSPICIOUS_FLAT_OUTPUT_FALLBACK_TO_INIT"
-        print("[IsabelaOS] WARNING: flat output detected; returning init image fallback.")
-        out = init_img
-
-    enc = encode_image_jpg(out)
-    return {
-        **enc,
-        "mode": "transform_anime_identity",
-        "engine": "sdxl_img2img",
-        "warning": warning,
-        "params": {
-            "steps": steps,
-            "guidance": guidance,
-            "strength": strength,
-            "seed": seed,
-            "size": [w, h],
-            "dtype_sdxl": str(DTYPE_SDXL),
-            "vae_fp32": True,
-            "used_user_prompt": bool(user_prompt),
+            "skin_mode": skin_mode,
         },
     }
 
 
 def handle_compose_scene(input_data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    NUEVO MÓDULO: MONTAJE IA LOCAL
+    MONTAJE IA LOCAL
     Usa el fondo EXACTO subido por el usuario.
     No regenera el escenario.
     No usa Flux.
@@ -1008,7 +756,6 @@ def handle_compose_scene(input_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     print("[IsabelaOS] handle_compose_scene() entered")
 
-    # imports diferidos: SOLO si de verdad se usa este modo
     from rembg import remove as rembg_remove
 
     fg_b64 = input_data.get("fg_image_b64") or input_data.get("person_image")
@@ -1148,17 +895,11 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
 
         if action == "health":
             return {
-                "message": "IsabelaOS worker online (FLUX txt2img + SDXL img2img Product + Anime Identity + Avatar support + Compose Scene + Identity Lock)"
+                "message": "IsabelaOS worker online (FLUX txt2img + anchors + identity lock + natural skin + compose scene)"
             }
 
         if action in ["generate", "txt2img_flux", "generate_image", "txt2img"]:
             return handle_txt2img(input_data)
-
-        if action == "headshot_pro":
-            return handle_product_studio_premium(input_data)
-
-        if action == "transform_anime_identity":
-            return handle_transform_anime_identity(input_data)
 
         if action == "compose_scene":
             return handle_compose_scene(input_data)
