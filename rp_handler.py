@@ -730,6 +730,7 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
     prompt = _safe_text(input_data.get("prompt", ""))
     effective_prompt = _safe_text(input_data.get("effective_prompt", "")) or prompt
     negative_prompt = _safe_text(input_data.get("negative_prompt", ""))
+    
     if "across frames" in effective_prompt.lower():
         effective_prompt = effective_prompt.replace("across frames", "")
     if "frame skipping" in effective_prompt.lower():
@@ -740,6 +741,7 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
         effective_prompt = effective_prompt.replace("gentle blinking", "")
     if "temporal wobble" in effective_prompt.lower():
         effective_prompt = effective_prompt.replace("temporal wobble", "")
+        
     skin_mode = _safe_text(input_data.get("skin_mode", "standard")).lower() or "standard"
 
     steps = int(input_data.get("steps", 4))
