@@ -521,9 +521,9 @@ def _refine_natural_skin(base_image: Image.Image, input_data: Dict[str, Any]) ->
             "beauty filter, glossy skin, CGI, change face, different face"
         )
 
-        steps = int(input_data.get("natural_skin_steps", 14))
-        guidance = float(input_data.get("natural_skin_guidance", 2.8))
-        strength = float(input_data.get("natural_skin_strength", 0.16))
+        steps = int(input_data.get("natural_skin_steps", 10))
+        guidance = float(input_data.get("natural_skin_guidance", 2.2))
+        strength = float(input_data.get("natural_skin_strength", 0.08))
 
         print(
             "[natural_skin_refine]",
@@ -535,6 +535,15 @@ def _refine_natural_skin(base_image: Image.Image, input_data: Dict[str, Any]) ->
             },
         )
 
+        def _add_pre_refine_noise(img, amount=0.015):
+            import numpy as np
+            arr = np.array(img).astype(np.float32)
+            noise = np.random.normal(0, amount * 255, arr.shape)
+            arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
+            return Image.fromarray(arr)
+
+        work_img = _add_pre_refine_noise(work_img, 0.015)
+        
         with torch.inference_mode():
             out = pipe(
                 prompt=refine_prompt,
