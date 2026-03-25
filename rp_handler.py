@@ -133,10 +133,10 @@ def get_img2img():
     print("[IsabelaOS] SDXL IMG2IMG loaded from pretrained ✅")
 
     try:
-    img2img_pipe.scheduler = UniPCMultistepScheduler.from_config(img2img_pipe.scheduler.config)
-    print("[IsabelaOS] SDXL scheduler switched to UniPC ✅")
-except Exception as e:
-    print("[IsabelaOS] Could not switch SDXL scheduler to UniPC:", repr(e))
+        img2img_pipe.scheduler = UniPCMultistepScheduler.from_config(img2img_pipe.scheduler.config)
+        print("[IsabelaOS] SDXL scheduler switched to UniPC ✅")
+    except Exception as e:
+        print("[IsabelaOS] Could not switch SDXL scheduler to UniPC:", repr(e))
 
     try:
         img2img_pipe.safety_checker = None
