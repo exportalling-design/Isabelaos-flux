@@ -765,6 +765,12 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
     has_avatar_anchor = bool(avatar_id and anchor_images)
     use_realistic_natural = bool(has_avatar_anchor and skin_mode == "natural")
 
+    # Forzar resolución fija para NATURAL + AVATAR
+    if use_realistic_natural:
+        print("[IsabelaOS] Forcing NATURAL + AVATAR resolution to 640x960")
+        width = 640
+        height = 960
+
     print(
         "[txt2img_pipeline]",
         {
@@ -870,16 +876,78 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
 
     print("[IsabelaOS] txt2img base generation finished ✅")
 
-    # 3) Identity lock SOLO si hay avatar + anchors
+        # 3) Identity lock + SDXL refine (STANDARD) si hay avatar + anchors
+
     identity_warning = None
+    standard_skin_warning = None
+
     if has_avatar_anchor:
         print("[IsabelaOS] Applying identity lock...")
         image, identity_warning = _apply_identity_lock(image, anchor_images)
+
         if identity_warning:
             print("[IsabelaOS] Identity lock warning:", identity_warning)
         else:
             print("[IsabelaOS] Identity lock applied ✅")
 
+        # 3.1) SDXL refine suave SOLO para STANDARD + AVATAR
+        if has_avatar_anchor and skin_mode == "standard":
+            print("[IsabelaOS] Applying SDXL light refine (STANDARD)...")
+
+            try:
+                pipe = get_img2img()
+
+                refine_prompt = (
+                    "natural skin texture, visible pores, subtle imperfections, "
+                    "real skin, unretouched photo, preserve face identity, same face"
+                )
+
+                refine_negative = (
+                    "plastic skin, smooth skin, airbrushed skin, beauty filter, "
+                    "glossy skin, CGI, change face, different face"
+                )
+
+                refine_strength = float(input_data.get("standard_refine_strength", 0.10))
+                refine_steps = int(input_data.get("standard_refine_steps", 10))
+                refine_guidance = float(input_data.get("standard_refine_guidance", 2.2))
+
+                print(
+                    "[standard_skin_refine]",
+                    {
+                        "steps": refine_steps,
+                        "guidance": refine_guidance,
+                        "strength": refine_strength,
+                    },
+                )
+
+                work_img = clamp_size(image, max_side=1024)
+                w, h = work_img.size
+
+                with torch.inference_mode():
+                    out = pipe(
+                        prompt=refine_prompt,
+                        negative_prompt=refine_negative,
+                        image=work_img,
+                        strength=refine_strength,
+                        guidance_scale=refine_guidance,
+                        num_inference_steps=refine_steps,
+                        width=w,
+                        height=h,
+                    ).images[0]
+
+                if is_flat_or_suspicious(out):
+                    standard_skin_warning = "STANDARD_SKIN_FLAT_OUTPUT"
+                else:
+                    if out.size != image.size:
+                        out = out.resize(image.size, Image.LANCZOS)
+
+                    image = out
+                    print("[IsabelaOS] SDXL light refine applied ✅")
+
+            except Exception as e:
+                print("[IsabelaOS] SDXL light refine failed:", repr(e))
+                print(traceback.format_exc())
+                standard_skin_warning = f"STANDARD_SKIN_FAILED: {e}"
     # 4) Skin natural refine
     # Solo se usa el refine viejo cuando skin_mode=natural PERO no entró al flujo Realistic Vision + avatar.
     natural_skin_warning = None
@@ -898,6 +966,7 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
         "engine": engine,
         "identity_warning": identity_warning,
         "natural_skin_warning": natural_skin_warning,
+        "standard_skin_warning": standard_skin_warning,
         "avatar": {
             "id": avatar_id,
             "name": avatar_name,
