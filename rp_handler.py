@@ -898,18 +898,18 @@ def handle_txt2img(input_data: Dict[str, Any]) -> Dict[str, Any]:
                 pipe = get_img2img()
 
                 refine_prompt = (
-                    "natural skin texture, visible pores, subtle imperfections, "
-                    "real skin, unretouched photo, preserve face identity, same face"
+                    "subtle natural skin texture, slight skin detail, preserve face identity, same face "
+                    
                 )
 
                 refine_negative = (
-                    "plastic skin, smooth skin, airbrushed skin, beauty filter, "
-                    "glossy skin, CGI, change face, different face"
+                    "change face, different face, altered eyes, altered nose, altered mouth,"
+                    "plastic skin, smooth skin, airbrushed skin, beauty filter, glossy skin, CGI"
                 )
 
-                refine_strength = float(input_data.get("standard_refine_strength", 0.10))
-                refine_steps = int(input_data.get("standard_refine_steps", 10))
-                refine_guidance = float(input_data.get("standard_refine_guidance", 2.2))
+                refine_strength = float(input_data.get("standard_refine_strength", 0.06))
+                refine_steps = int(input_data.get("standard_refine_steps", 8))
+                refine_guidance = float(input_data.get("standard_refine_guidance", 1.8))
 
                 print(
                     "[standard_skin_refine]",
