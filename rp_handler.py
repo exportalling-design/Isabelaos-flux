@@ -1,4 +1,3 @@
-
 # rp_handler.py – IsabelaOS Studio v3
 # FIXES v3:
 #   1. BASE_VOLUME lee ISE_VOLUME_MOUNT correctamente
