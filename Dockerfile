@@ -4,7 +4,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /workspace
 
-# Solo dependencias del sistema — sin pip install pesado
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     ffmpeg \
@@ -14,10 +13,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Solo runpod — sin torch ni diffusers todavía
 RUN pip install --no-cache-dir runpod==1.7.3
 
-# Handler mínimo
+# Agregando torch
+RUN pip install --no-cache-dir torch==2.3.1+cu121 torchvision==0.18.1+cu121 \
+    --index-url https://download.pytorch.org/whl/cu121
+
 COPY rp_handler.py /workspace/rp_handler.py
 
 CMD ["python3", "-u", "rp_handler.py"]
