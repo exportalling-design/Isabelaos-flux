@@ -43,4 +43,8 @@ RUN git clone https://github.com/sczhou/CodeFormer /workspace/CodeFormer \
 COPY rp_handler.py /workspace/rp_handler.py
 
 # Arrancar el handler directamente
-CMD ["python", "-u", "/workspace/rp_handler.py"]
+# exit code 127 = python no encontrado en PATH
+# runpod/base usa python3 — además crear symlink por si acaso
+RUN ln -sf /usr/bin/python3 /usr/bin/python || true
+
+CMD ["python3", "-u", "/workspace/rp_handler.py"]
