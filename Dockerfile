@@ -1,8 +1,8 @@
 # Dockerfile — IsabelaOS Studio · RunPod Serverless
-# FIX: usar runpod/pytorch como base en lugar de runpod/base
-# runpod/base:0.6.2 tiene scripts de inicio para desarrollo local
-# que fallan en serverless porque RUNPOD_PROJECT_ID no existe
-FROM runpod/pytorch:2.1.0-py3.10-cuda12.1.0-devel-ubuntu22.04
+# FIX principal: remover PYTHONPATH de CodeFormer que causa conflicto con basicsr
+# FIX secundario: CMD explícito para lanzar el handler directamente
+# ignorando el post-start script de runpod/base que falla con RUNPOD_PROJECT_ID
+FROM runpod/base:0.6.2-cuda12.1.0
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /workspace
@@ -21,7 +21,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # RunPod SDK
 RUN pip install --no-cache-dir runpod==1.7.3
 
-# PyTorch ya viene en la imagen base — solo instalar el resto
+# PyTorch con CUDA 12.1
+RUN pip install --no-cache-dir torch==2.3.1+cu121 torchvision==0.18.1+cu121 \
+    --index-url https://download.pytorch.org/whl/cu121
+
 COPY requirements.txt /workspace/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
