@@ -63,6 +63,18 @@ def install_deps():
 install_deps()
 
 # ══════════════════════════════════════════════════════════════════════════
+# FIX: basicsr usa torchvision.transforms.functional_tensor que fue
+# removido en torchvision>=0.16. Este monkey-patch lo restaura.
+# ══════════════════════════════════════════════════════════════════════════
+import types, sys
+if 'torchvision.transforms.functional_tensor' not in sys.modules:
+    import torchvision.transforms.functional as _F
+    _ft = types.ModuleType('torchvision.transforms.functional_tensor')
+    _ft.rgb_to_grayscale = _F.rgb_to_grayscale
+    sys.modules['torchvision.transforms.functional_tensor'] = _ft
+    print("[IsabelaOS] basicsr functional_tensor patch aplicado ✅")
+
+# ══════════════════════════════════════════════════════════════════════════
 # IMPORTS (despues de instalar dependencias)
 # ══════════════════════════════════════════════════════════════════════════
 
