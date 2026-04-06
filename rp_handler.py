@@ -1,19 +1,70 @@
-# rp_handler.py – IsabelaOS Studio v4
-# FIXES v4:
-#   1. Deshabilitar HF_HUB_ENABLE_HF_TRANSFER antes de cualquier import
-#   2. Forzar numpy<2 compatible con onnxruntime compilado para numpy 1.x
-#   3. BASE_VOLUME lee ISE_VOLUME_MOUNT correctamente
-#   4. CodeFormer usa basicsr de pip (no del repo clonado)
-#   5. Realistic Vision con prompts forzados de piel imperfecta real
-#   6. Resolucion RV reducida a 512x768 para evitar personas duplicadas
-#   7. Sufijos de prompt cortos para no truncar CLIP (limite 77 tokens)
+# rp_handler.py – IsabelaOS Studio v5
+# FIX v5: dependencias se instalan en runtime, no en build
+# Dockerfile solo necesita runpod==1.7.3 — todo lo demas se instala al primer arranque
+# El marker /workspace/.deps_ok evita reinstalar en arranques siguientes
 
-import os, sys
+import os, sys, subprocess
 
-# ── FIX 1: Deshabilitar hf_transfer ANTES de importar huggingface ─────────
-# runpod/base tiene HF_HUB_ENABLE_HF_TRANSFER=1 pero hf_transfer no está
-# instalado — esto causa ValueError al primer download de modelo
+# FIX 1: Deshabilitar hf_transfer ANTES de cualquier import de huggingface
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
+DEPS_MARKER   = "/workspace/.deps_ok"
+CF_REPO_PATH  = "/workspace/CodeFormer"
+REQ_PATH      = "/workspace/requirements.txt"
+
+# ══════════════════════════════════════════════════════════════════════════
+# INSTALACION DE DEPENDENCIAS EN RUNTIME
+# ══════════════════════════════════════════════════════════════════════════
+
+def _run(cmd, label=""):
+    print(f"[deps] {label or ' '.join(cmd[:3])}...")
+    r = subprocess.run(cmd, text=True)
+    if r.returncode != 0:
+        print(f"[deps] WARNING: {label} salió con código {r.returncode}")
+    return r.returncode == 0
+
+def install_deps():
+    if os.path.exists(DEPS_MARKER):
+        print("[IsabelaOS] Dependencias ya instaladas ✅")
+        return
+
+    print("[IsabelaOS] ═══ Instalando dependencias en runtime (primera vez) ═══")
+
+    # 1. Torch con CUDA 12.1
+    _run([
+        sys.executable, "-m", "pip", "install", "--no-cache-dir",
+        "torch==2.3.1+cu121", "torchvision==0.18.1+cu121",
+        "--index-url", "https://download.pytorch.org/whl/cu121"
+    ], "torch+cuda")
+
+    # 2. requirements.txt
+    if os.path.exists(REQ_PATH):
+        _run([sys.executable, "-m", "pip", "install", "--no-cache-dir", "-r", REQ_PATH],
+             "requirements.txt")
+    else:
+        print(f"[deps] WARNING: {REQ_PATH} no encontrado")
+
+    # 3. CodeFormer — clonar si no existe
+    if not os.path.exists(CF_REPO_PATH):
+        _run(["git", "clone", "--depth=1",
+              "https://github.com/sczhou/CodeFormer", CF_REPO_PATH], "clone CodeFormer")
+    else:
+        print("[deps] CodeFormer ya clonado, saltando")
+
+    cf_req = os.path.join(CF_REPO_PATH, "requirements.txt")
+    if os.path.exists(cf_req):
+        _run([sys.executable, "-m", "pip", "install", "--no-cache-dir", "-r", cf_req],
+             "CodeFormer requirements")
+
+    # Marcar como instalado
+    open(DEPS_MARKER, "w").close()
+    print("[IsabelaOS] ═══ Dependencias instaladas ✅ ═══")
+
+install_deps()
+
+# ══════════════════════════════════════════════════════════════════════════
+# IMPORTS (despues de instalar dependencias)
+# ══════════════════════════════════════════════════════════════════════════
 
 import io, base64, urllib.request, traceback, hashlib
 from typing import Dict, Any, Optional, List
@@ -25,11 +76,11 @@ import runpod
 # ── Volumen y cache ────────────────────────────────────────────────────────
 BASE_VOLUME = os.environ.get("ISE_VOLUME_MOUNT", "/runpod/volumes/isabela-video")
 
-os.environ.setdefault("HF_HOME",           f"{BASE_VOLUME}/huggingface")
-os.environ.setdefault("HF_HUB_CACHE",      f"{BASE_VOLUME}/huggingface/hub")
-os.environ.setdefault("TRANSFORMERS_CACHE", f"{BASE_VOLUME}/huggingface/transformers")
-os.environ.setdefault("DIFFUSERS_CACHE",    f"{BASE_VOLUME}/huggingface/diffusers")
-os.environ.setdefault("TORCH_HOME",         f"{BASE_VOLUME}/torch")
+os.environ.setdefault("HF_HOME",            f"{BASE_VOLUME}/huggingface")
+os.environ.setdefault("HF_HUB_CACHE",       f"{BASE_VOLUME}/huggingface/hub")
+os.environ.setdefault("TRANSFORMERS_CACHE",  f"{BASE_VOLUME}/huggingface/transformers")
+os.environ.setdefault("DIFFUSERS_CACHE",     f"{BASE_VOLUME}/huggingface/diffusers")
+os.environ.setdefault("TORCH_HOME",          f"{BASE_VOLUME}/torch")
 
 ANCHOR_CACHE_DIR   = f"{BASE_VOLUME}/avatar_anchors"
 FACE_MODELS_DIR    = f"{BASE_VOLUME}/face_models"
@@ -43,7 +94,7 @@ for p in [
 ]:
     os.makedirs(p, exist_ok=True)
 
-from diffusers import FluxPipeline, UniPCMultistepScheduler, StableDiffusionPipeline, AutoencoderKL
+from diffusers import FluxPipeline, UniPCMultistepScheduler, StableDiffusionPipeline
 
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE_FLUX = torch.float16 if DEVICE == "cuda" else torch.float32
@@ -67,22 +118,19 @@ _cf_net   = _cf_helper = None
 
 print("[IsabelaOS] Worker booting... DEVICE =", DEVICE, "| BASE_VOLUME =", BASE_VOLUME)
 
-
 # ══════════════════════════════════════════════════════════════════════════
-# PROMPTS FORZADOS PARA PIEL NATURAL IMPERFECTA
+# PROMPTS PARA PIEL NATURAL IMPERFECTA
 # ══════════════════════════════════════════════════════════════════════════
 
 RV_SKIN_SUFFIX = (
     ", skin pores, freckles, moles, stretch marks, skin rolls, "
     "cellulite, acne scars, unretouched skin, one person only"
 )
-
 RV_SKIN_NEGATIVE = (
     ", smooth skin, perfect skin, airbrushed, plastic skin, "
     "beauty filter, flawless, two people, duplicate person, "
     "multiple faces, extra head, cloned face"
 )
-
 
 # ══════════════════════════════════════════════════════════════════════════
 # PIPELINES
@@ -128,7 +176,6 @@ def get_realistic_vision():
     print("[IsabelaOS] Realistic Vision ready ✅")
     return realistic_pipe
 
-
 # ══════════════════════════════════════════════════════════════════════════
 # CODEFORMER
 # ══════════════════════════════════════════════════════════════════════════
@@ -139,10 +186,9 @@ def get_codeformer():
         return _cf_net, _cf_helper
     print("[IsabelaOS] Loading CodeFormer...")
 
-    import sys
-    cf_repo = "/workspace/CodeFormer"
-    if cf_repo in sys.path:
-        sys.path.remove(cf_repo)
+    # Usar basicsr de pip, no del repo clonado
+    if CF_REPO_PATH in sys.path:
+        sys.path.remove(CF_REPO_PATH)
 
     from basicsr.archs.codeformer_arch import CodeFormer as CF
     from facelib.utils.face_restoration_helper import FaceRestoreHelper
@@ -205,7 +251,6 @@ def run_codeformer(img_pil: Image.Image, fidelity_weight: float = 0.90) -> Image
         print(traceback.format_exc())
         return img_pil
 
-
 # ══════════════════════════════════════════════════════════════════════════
 # UTILIDADES
 # ══════════════════════════════════════════════════════════════════════════
@@ -221,17 +266,14 @@ def encode_image_jpg(img: Image.Image, quality: int = 92) -> Dict[str, str]:
         "image_base64": b64, "data_url": url,
     }
 
-
 def decode_image(b64: str) -> Image.Image:
     return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
-
 
 def is_flat(img: Image.Image) -> bool:
     try:
         return np.array(img.convert("RGB"), dtype=np.uint8).std() < 2.0
     except Exception:
         return False
-
 
 def _safe_text(s, max_len=1200):
     return ("" if s is None else str(s)).replace("\x00", "").strip()[:max_len]
@@ -252,7 +294,6 @@ def _safe_list(v):
 
 def pil_to_bgr(img): return cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
 def bgr_to_pil(arr): return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
-
 
 # ══════════════════════════════════════════════════════════════════════════
 # ANCHORS
@@ -294,7 +335,6 @@ def _load_anchor_images(urls: List[str], avatar_id: Optional[str]) -> List[Image
         except Exception as e:
             print("[IsabelaOS] WARNING anchor:", repr(e))
     return images
-
 
 # ══════════════════════════════════════════════════════════════════════════
 # INSIGHTFACE
@@ -361,9 +401,8 @@ def _apply_identity_lock(image: Image.Image, anchors: List[Image.Image]):
         print("[IsabelaOS] Identity lock failed:", repr(e))
         return image, f"IDENTITY_LOCK_FAILED: {e}"
 
-
 # ══════════════════════════════════════════════════════════════════════════
-# MONTAJE IA
+# MONTAJE IA (compose_scene)
 # ══════════════════════════════════════════════════════════════════════════
 
 def _feather_alpha(a, px):
@@ -402,7 +441,6 @@ def _contact_shadow(bg, mask, box, opacity=0.18):
     for c in range(3):
         out[..., c] = out[..., c].astype(np.float32) * (1 - canvas)
     return np.clip(out, 0, 255).astype(np.uint8)
-
 
 # ══════════════════════════════════════════════════════════════════════════
 # ACTION: TXT2IMG
@@ -523,7 +561,6 @@ def handle_txt2img(inp: Dict[str, Any]) -> Dict[str, Any]:
         },
     }
 
-
 # ══════════════════════════════════════════════════════════════════════════
 # ACTION: COMPOSE SCENE
 # ══════════════════════════════════════════════════════════════════════════
@@ -603,7 +640,6 @@ def handle_compose_scene(inp: Dict[str, Any]) -> Dict[str, Any]:
         **enc, "mode": "compose_scene", "engine": "local_compositor",
         "params": {"x": x, "y": y, "scale": scale, "feather": feather, "mode": mode},
     }
-
 
 # ══════════════════════════════════════════════════════════════════════════
 # HANDLER PRINCIPAL
