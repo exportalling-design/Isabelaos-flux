@@ -138,6 +138,14 @@ RV_SKIN_SUFFIX = (
     ", skin pores, freckles, moles, stretch marks, skin rolls, "
     "cellulite, acne scars, unretouched skin, one person only"
 )
+# Negative NSFW agresivo — siempre inyectado en Realistic Vision
+# independientemente del prompt del usuario
+RV_NSFW_NEGATIVE = (
+    "nude, naked, nsfw, explicit, sexual content, genitals, "
+    "bare breasts, exposed breasts, topless, bottomless, "
+    "porn, pornographic, erotic, adult content, hentai, "
+    "underwear only, lingerie only, bikini only"
+)
 RV_SKIN_NEGATIVE = (
     ", smooth skin, perfect skin, airbrushed, plastic skin, "
     "beauty filter, flawless, two people, duplicate person, "
@@ -198,9 +206,10 @@ def get_codeformer():
         return _cf_net, _cf_helper
     print("[IsabelaOS] Loading CodeFormer...")
 
-    # Usar basicsr de pip, no del repo clonado
-    if CF_REPO_PATH in sys.path:
-        sys.path.remove(CF_REPO_PATH)
+    # codeformer_arch solo existe en el repo clonado, no en basicsr de PyPI.
+    # Insertar el repo al sys.path para que basicsr.archs lo encuentre.
+    if CF_REPO_PATH not in sys.path:
+        sys.path.insert(0, CF_REPO_PATH)
 
     from basicsr.archs.codeformer_arch import CodeFormer as CF
     from facelib.utils.face_restoration_helper import FaceRestoreHelper
@@ -508,7 +517,7 @@ def handle_txt2img(inp: Dict[str, Any]) -> Dict[str, Any]:
         rv_guidance = _safe_float(inp.get("natural_rv_guidance", 7.0))
 
         rv_prompt = eff[:200] + RV_SKIN_SUFFIX
-        rv_neg    = neg[:100] + RV_SKIN_NEGATIVE
+        rv_neg    = RV_NSFW_NEGATIVE + (", " + neg[:100] if neg else "") + RV_SKIN_NEGATIVE
 
         print(f"[RV] prompt ({len(rv_prompt)} chars): {rv_prompt[:80]}...")
         print(f"[RV] steps={rv_steps} guidance={rv_guidance} size={width}x{height}")
