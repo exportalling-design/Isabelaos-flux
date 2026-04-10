@@ -206,14 +206,14 @@ def get_codeformer():
         return _cf_net, _cf_helper
     print("[IsabelaOS] Loading CodeFormer...")
 
-    # El repo clonado tiene su propio basicsr/archs/ con vqgan_arch, codeformer_arch, etc.
-    # Insertar al INICIO del path para que sus módulos tengan prioridad sobre el paquete de pip.
+    # Purgar TODO basicsr del cache antes de insertar el repo al path.
+    # Si no, el registry detecta doble registro (pip basicsr ya cargo EDVR, etc.)
+    for key in list(sys.modules.keys()):
+        if key == 'basicsr' or key.startswith('basicsr.'):
+            del sys.modules[key]
+
     if CF_REPO_PATH not in sys.path:
         sys.path.insert(0, CF_REPO_PATH)
-    # Invalidar cualquier cache de basicsr.archs que Python haya cargado del paquete pip
-    for key in list(sys.modules.keys()):
-        if key.startswith("basicsr.archs"):
-            del sys.modules[key]
 
     from basicsr.archs.codeformer_arch import CodeFormer as CF
     from facelib.utils.face_restoration_helper import FaceRestoreHelper
