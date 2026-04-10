@@ -206,15 +206,16 @@ def get_codeformer():
         return _cf_net, _cf_helper
     print("[IsabelaOS] Loading CodeFormer...")
 
-    # Importar directamente desde el archivo del repo clonado
-    # basicsr de PyPI no incluye codeformer_arch — solo está en el repo
-    import importlib.util, pathlib
-    cf_arch_path = pathlib.Path(CF_REPO_PATH) / "basicsr" / "archs" / "codeformer_arch.py"
-    spec = importlib.util.spec_from_file_location("codeformer_arch", cf_arch_path)
-    cf_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cf_module)
-    CF = cf_module.CodeFormer
+    # El repo clonado tiene su propio basicsr/archs/ con vqgan_arch, codeformer_arch, etc.
+    # Insertar al INICIO del path para que sus módulos tengan prioridad sobre el paquete de pip.
+    if CF_REPO_PATH not in sys.path:
+        sys.path.insert(0, CF_REPO_PATH)
+    # Invalidar cualquier cache de basicsr.archs que Python haya cargado del paquete pip
+    for key in list(sys.modules.keys()):
+        if key.startswith("basicsr.archs"):
+            del sys.modules[key]
 
+    from basicsr.archs.codeformer_arch import CodeFormer as CF
     from facelib.utils.face_restoration_helper import FaceRestoreHelper
 
     if not os.path.exists(CODEFORMER_WEIGHTS):
