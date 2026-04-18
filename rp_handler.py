@@ -1,16 +1,16 @@
-# rp_handler.py – IsabelaOS Studio v5
-# FIX v5: dependencias se instalan en runtime, no en build
-# Dockerfile solo necesita runpod==1.7.3 — todo lo demas se instala al primer arranque
-# El marker /workspace/.deps_ok evita reinstalar en arranques siguientes
+# rp_handler.py – IsabelaOS Studio v6
+# FIX v6: basicsr/version.py creado en runtime para evitar ModuleNotFoundError
+# El repo clonado de CodeFormer no incluye version.py — se crea antes del import
+# NO se purga basicsr de sys.modules (causaba el error de doble registro)
 
 import os, sys, subprocess
 
 # FIX 1: Deshabilitar hf_transfer ANTES de cualquier import de huggingface
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
-DEPS_MARKER   = "/workspace/.deps_ok"
-CF_REPO_PATH  = "/workspace/CodeFormer"
-REQ_PATH      = "/workspace/requirements.txt"
+DEPS_MARKER  = "/workspace/.deps_ok"
+CF_REPO_PATH = "/workspace/CodeFormer"
+REQ_PATH     = "/workspace/requirements.txt"
 
 # ══════════════════════════════════════════════════════════════════════════
 # INSTALACION DE DEPENDENCIAS EN RUNTIME
@@ -66,7 +66,7 @@ install_deps()
 # FIX: basicsr usa torchvision.transforms.functional_tensor que fue
 # removido en torchvision>=0.16. Este monkey-patch lo restaura.
 # ══════════════════════════════════════════════════════════════════════════
-import types, sys
+import types
 if 'torchvision.transforms.functional_tensor' not in sys.modules:
     import torchvision.transforms.functional as _F
     _ft = types.ModuleType('torchvision.transforms.functional_tensor')
@@ -75,7 +75,28 @@ if 'torchvision.transforms.functional_tensor' not in sys.modules:
     print("[IsabelaOS] basicsr functional_tensor patch aplicado ✅")
 
 # ══════════════════════════════════════════════════════════════════════════
-# IMPORTS (despues de instalar dependencias)
+# FIX v6: Crear basicsr/version.py en el repo clonado si no existe.
+# El repo de CodeFormer tiene su propia carpeta basicsr/ sin version.py,
+# lo que causa ModuleNotFoundError al importar basicsr desde ahi.
+# Solución: crear el archivo antes de cualquier import, y NO purgar
+# sys.modules (la purga causaba que se cargara el basicsr del repo
+# en lugar del instalado via pip, que sí tiene version.py).
+# ══════════════════════════════════════════════════════════════════════════
+def _patch_codeformer_basicsr():
+    cf_basicsr = os.path.join(CF_REPO_PATH, "basicsr")
+    version_file = os.path.join(cf_basicsr, "version.py")
+    if os.path.isdir(cf_basicsr) and not os.path.exists(version_file):
+        try:
+            with open(version_file, "w") as f:
+                f.write('__version__ = "1.4.2"\n__gitsha__ = "unknown"\n')
+            print("[IsabelaOS] basicsr/version.py patch aplicado ✅")
+        except Exception as e:
+            print("[IsabelaOS] WARNING: no se pudo crear version.py:", repr(e))
+
+_patch_codeformer_basicsr()
+
+# ══════════════════════════════════════════════════════════════════════════
+# IMPORTS (despues de instalar dependencias y aplicar patches)
 # ══════════════════════════════════════════════════════════════════════════
 
 import io, base64, urllib.request, traceback, hashlib
@@ -88,11 +109,11 @@ import runpod
 # ── Volumen y cache ────────────────────────────────────────────────────────
 BASE_VOLUME = os.environ.get("ISE_VOLUME_MOUNT", "/runpod/volumes/isabela-video")
 
-os.environ.setdefault("HF_HOME",            f"{BASE_VOLUME}/huggingface")
-os.environ.setdefault("HF_HUB_CACHE",       f"{BASE_VOLUME}/huggingface/hub")
-os.environ.setdefault("TRANSFORMERS_CACHE",  f"{BASE_VOLUME}/huggingface/transformers")
-os.environ.setdefault("DIFFUSERS_CACHE",     f"{BASE_VOLUME}/huggingface/diffusers")
-os.environ.setdefault("TORCH_HOME",          f"{BASE_VOLUME}/torch")
+os.environ.setdefault("HF_HOME",           f"{BASE_VOLUME}/huggingface")
+os.environ.setdefault("HF_HUB_CACHE",      f"{BASE_VOLUME}/huggingface/hub")
+os.environ.setdefault("TRANSFORMERS_CACHE", f"{BASE_VOLUME}/huggingface/transformers")
+os.environ.setdefault("DIFFUSERS_CACHE",   f"{BASE_VOLUME}/huggingface/diffusers")
+os.environ.setdefault("TORCH_HOME",        f"{BASE_VOLUME}/torch")
 
 ANCHOR_CACHE_DIR   = f"{BASE_VOLUME}/avatar_anchors"
 FACE_MODELS_DIR    = f"{BASE_VOLUME}/face_models"
@@ -139,7 +160,6 @@ RV_SKIN_SUFFIX = (
     "cellulite, acne scars, unretouched skin, one person only"
 )
 # Negative NSFW agresivo — siempre inyectado en Realistic Vision
-# independientemente del prompt del usuario
 RV_NSFW_NEGATIVE = (
     "nude, naked, nsfw, explicit, sexual content, genitals, "
     "bare breasts, exposed breasts, topless, bottomless, "
@@ -198,6 +218,9 @@ def get_realistic_vision():
 
 # ══════════════════════════════════════════════════════════════════════════
 # CODEFORMER
+# FIX v6: NO purgar sys.modules de basicsr.
+# Solo agregar facelib al path para que Python encuentre FaceRestoreHelper.
+# basicsr se importa desde pip (que sí tiene version.py), no del repo.
 # ══════════════════════════════════════════════════════════════════════════
 
 def get_codeformer():
@@ -206,12 +229,8 @@ def get_codeformer():
         return _cf_net, _cf_helper
     print("[IsabelaOS] Loading CodeFormer...")
 
-    # Purgar TODO basicsr del cache antes de insertar el repo al path.
-    # Si no, el registry detecta doble registro (pip basicsr ya cargo EDVR, etc.)
-    for key in list(sys.modules.keys()):
-        if key == 'basicsr' or key.startswith('basicsr.'):
-            del sys.modules[key]
-
+    # Solo agregar el repo al path para que facelib sea importable.
+    # NO purgar basicsr — usamos el instalado via pip que tiene version.py.
     if CF_REPO_PATH not in sys.path:
         sys.path.insert(0, CF_REPO_PATH)
 
@@ -427,7 +446,7 @@ def _apply_identity_lock(image: Image.Image, anchors: List[Image.Image]):
         return image, f"IDENTITY_LOCK_FAILED: {e}"
 
 # ══════════════════════════════════════════════════════════════════════════
-# MONTAJE IA (compose_scene)
+# MONTAJE IA (compose_scene helpers)
 # ══════════════════════════════════════════════════════════════════════════
 
 def _feather_alpha(a, px):
